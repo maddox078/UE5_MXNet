@@ -1,0 +1,2593 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "YOLO.h"
+
+
+YOLO::YOLO(int ImageDims, TArray<int> ActivationIDSched, TArray<int> StrideSched, TArray<int> FilterCountSched, TArray<int> FilterDimSched, TArray<int> PaddingSched, TArray<int>HeadStrideSched, TArray<int>HeadFilterDimSched, TArray<int> HeadPaddingSched, TArray<TArray<TArray<double>>> AnchorInputs, TArray<int> AnchorHeadLayerIDs, TArray<double> LearnRate)
+{
+	int A = 0;
+	int B = 0;
+	int C = 0;
+	int D = 0;
+	int E = 0;
+	double StdDev = 0;
+	double TempImageDims = 0;
+	int InputCount = 0;
+	int FilterCount = 0;
+	int FeatureCount = 0;
+	int BiasCount = 0;
+	int TransitionDeltaCount = 0;
+	int TransitionActivationCount = 0;
+
+	StrideSchedule = StrideSched;
+	FilterDimSchedule = FilterDimSched;
+	ActivationFunctionSchedule = ActivationIDSched;
+	MapCounts = FilterCountSched;
+	FilterDims = FilterDimSched;
+	ImageDimPx = ImageDims;
+	PaddingSchedule = PaddingSched;
+	LearningRate = LearnRate;
+	AnchorHeadIDs = AnchorHeadLayerIDs;
+	HeadStrideSchedule = HeadStrideSched;
+	HeadPaddingSchedule = HeadPaddingSched;
+	HeadFilterDims = HeadFilterDimSched;
+
+	Anchors.SetNum(AnchorInputs.Num());
+	for (int i = 0; i < AnchorInputs.Num(); ++i)
+	{
+		Anchors[i].SetNum(AnchorInputs[i].Num());
+		for (int j = 0; j < AnchorInputs[i].Num(); ++j)
+		{
+			Anchors[i][j] = AnchorInputs[i][j];
+		}
+	}
+
+	MapDims.SetNum(ActivationIDSched.Num());
+
+	TempImageDims = FMath::Floor((ImageDimPx + 2.0 * PaddingSchedule[0] - FilterDimSchedule[0]) / StrideSchedule[0]) + 1.0;
+
+	while (A < ActivationIDSched.Num())
+	{
+		if (A == 0)
+		{
+			InputCount = 1;
+		}
+		else
+		{
+			InputCount = MapCounts[A - 1];
+		}
+
+		MapDims[A] = TempImageDims;
+
+		FeatureCount += FilterCountSched[A] * TempImageDims * TempImageDims;
+		FilterCount += FilterCountSched[A] * InputCount * FilterDimSched[A] * FilterDimSched[A];
+		BiasCount += FilterCountSched[A];
+
+		if (A < ActivationIDSched.Num() - 1)
+		{
+			TempImageDims = FMath::Floor((TempImageDims + 2.0 * PaddingSchedule[A + 1] - FilterDimSchedule[A + 1]) / StrideSchedule[A + 1]) + 1.0;
+		}
+
+		A++;
+	}
+
+	Features.SetNumZeroed(FeatureCount);
+	NetFeatures.SetNumZeroed(FeatureCount);
+	Errors.SetNumZeroed(FeatureCount);
+	TempGradientsWRTInputs.SetNumZeroed(FeatureCount);
+	Derivatives.SetNumZeroed(FeatureCount);
+	NormFeatures.SetNumZeroed(FeatureCount);
+	Bias.SetNumZeroed(BiasCount);
+	BiasDelta.SetNumZeroed(BiasCount);
+	BiasMean.SetNumZeroed(BiasCount);
+	BiasVar.SetNumZeroed(BiasCount);
+	NormGamma.SetNumZeroed(BiasCount);
+	NormGammaDelta.SetNumZeroed(BiasCount);
+	NormGammaMean.SetNumZeroed(BiasCount);
+	NormGammaVar.SetNumZeroed(BiasCount);
+	NormBeta.SetNumZeroed(BiasCount);
+	NormBetaDelta.SetNumZeroed(BiasCount);
+	NormBetaMean.SetNumZeroed(BiasCount);
+	NormBetaVar.SetNumZeroed(BiasCount);
+	NormMean.SetNumZeroed(BiasCount);
+	NormVar.SetNumZeroed(BiasCount);
+	Deltas.SetNumZeroed(FilterCount);
+	DeltaMean.SetNumZeroed(FilterCount);
+	DeltaVar.SetNumZeroed(FilterCount);
+	Filters.SetNumZeroed(FilterCount);
+
+	//HeadErrors.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadFeatures.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadNetFeatures.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadFilters.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadBiases.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadBiasDeltas.SetNumZeroed(AnchorHeadIDs.Num());
+	//HeadDeltas.SetNumZeroed(AnchorHeadIDs.Num()); // added
+	//HeadDeltasMean.SetNumZeroed(AnchorHeadIDs.Num()); // added
+	//HeadDeltasVar.SetNumZeroed(AnchorHeadIDs.Num()); // added
+	//HeadFeatureDims.SetNumZeroed(AnchorHeadIDs.Num());
+
+	A = 0;
+	while (A < BiasCount)
+	{
+		NormVar[A] = 1.0;
+		NormGamma[A] = 1.0;
+		//Bias[A] = FMath::FRandRange(0.001, 0.01);
+
+		A++;
+	}
+
+	A = 0;
+	int FilterOffset = 0;
+
+	for (int LayerID = 0; LayerID < ActivationIDSched.Num(); ++LayerID)
+	{
+		int InputChannels = (LayerID == 0) ? 1 : MapCounts[LayerID - 1];
+		int OutputChannels = MapCounts[LayerID];
+		int KernelSize = FilterDimSched[LayerID];
+		int NumWeightsPerFilter = InputChannels * KernelSize * KernelSize;
+
+		// He uniform initialization limit
+		double Limit = FMath::Sqrt(6.0 / (double)NumWeightsPerFilter);
+
+		for (int OC = 0; OC < OutputChannels; ++OC)
+		{
+			for (int IC = 0; IC < InputChannels; ++IC)
+			{
+				for (int KH = 0; KH < KernelSize; ++KH)
+				{
+					for (int KW = 0; KW < KernelSize; ++KW)
+					{
+						int Idx = FilterOffset + OC * NumWeightsPerFilter + IC * (KernelSize * KernelSize) + KH * KernelSize + KW;
+						Filters[Idx] = FMath::FRandRange(-Limit, Limit);
+					}
+				}
+			}
+		}
+
+		FilterOffset += OutputChannels * NumWeightsPerFilter;
+	}
+
+	HeadNormMean.SetNum(AnchorHeadIDs.Num());
+	HeadNormVar.SetNum(AnchorHeadIDs.Num());
+	HeadFeatures.SetNum(AnchorHeadIDs.Num());
+	HeadNetFeatures.SetNum(AnchorHeadIDs.Num());
+	HeadErrors.SetNum(AnchorHeadIDs.Num());
+	HeadDeltas.SetNum(AnchorHeadIDs.Num());
+	HeadDeltasMean.SetNum(AnchorHeadIDs.Num());
+	HeadDeltasVar.SetNum(AnchorHeadIDs.Num());
+	HeadBiases.SetNum(AnchorHeadIDs.Num());
+	HeadBiasMean.SetNum(AnchorHeadIDs.Num());
+	HeadBiasVar.SetNum(AnchorHeadIDs.Num());
+	HeadBiasDeltas.SetNum(AnchorHeadIDs.Num());
+	HeadFilters.SetNum(AnchorHeadIDs.Num());
+	HeadFeatureDims.SetNum(AnchorHeadIDs.Num());
+
+	for (int HeadIdx = 0; HeadIdx < AnchorHeadIDs.Num(); ++HeadIdx)
+	{
+		const int LayerID = AnchorHeadIDs[HeadIdx];
+
+		// === Match ConvolveHead: heads branch from SAME layer ===
+		const int InputDim = MapDims[LayerID];
+		const int InputChannels = MapCounts[LayerID];
+
+		const int FilterDim = HeadFilterDims[HeadIdx];
+		const int Stride = HeadStrideSchedule[HeadIdx];
+		const int Padding = HeadPaddingSchedule[HeadIdx];
+		const int NumAnchors = Anchors[HeadIdx].Num();
+
+		const int OutputChannels = NumAnchors * 5; // conf, tx, ty, tw, th
+		const int OutputDim = ((InputDim + 2 * Padding - FilterDim) / Stride) + 1;
+		const int OutputPlaneSize = OutputDim * OutputDim;
+		const int HeadOutputSize = OutputChannels * OutputPlaneSize;
+		const int FilterCounts = OutputChannels * InputChannels * FilterDim * FilterDim;
+
+		// Store for later dimension checks
+		HeadFeatureDims[HeadIdx] = OutputDim;
+
+		// Allocate buffers
+		HeadFilters.SetNum(Anchors.Num());
+		HeadBiases.SetNum(Anchors.Num());
+		HeadDeltas.SetNum(Anchors.Num());
+		HeadDeltasMean.SetNum(Anchors.Num());
+		HeadDeltasVar.SetNum(Anchors.Num());
+		HeadBiasDeltas.SetNum(Anchors.Num());
+
+
+		// >>> Add these two lines <<<
+		HeadBiasMean.SetNum(Anchors.Num());
+		HeadBiasVar.SetNum(Anchors.Num());
+
+		HeadFeatures.SetNum(Anchors.Num());
+		HeadErrors.SetNum(Anchors.Num());
+
+		for (int h = 0; h < Anchors.Num(); ++h)
+		{
+			int numAnch = Anchors[h].Num();
+			const int kOutPerAnchor = 5;
+			const int outCh = numAnch * kOutPerAnchor;
+
+			const int layerID = AnchorHeadIDs[h];
+			const int inCh = MapCounts[layerID];
+			const int kDim = HeadFilterDims[h];
+			const int numWeights = outCh * inCh * kDim * kDim;
+
+			// --- Filters ---
+			HeadFilters[h].SetNum(numWeights);
+			HeadDeltas[h].SetNumZeroed(numWeights);
+			HeadDeltasMean[h].SetNumZeroed(numWeights);
+			HeadDeltasVar[h].SetNumZeroed(numWeights);
+
+			double limit = FMath::Sqrt(6.0 / (inCh * kDim * kDim + outCh)) ;
+			for (int i = 0; i < numWeights; ++i)
+				HeadFilters[h][i] = FMath::RandRange(-limit*0.65, limit*0.65);
+
+				
+
+			// --- Biases ---
+			HeadBiases[h].SetNum(outCh);
+			HeadBiasDeltas[h].SetNumZeroed(outCh);
+
+			// >>> Add these lines to properly initialize optimizer states <<<
+			HeadBiasMean[h].SetNumZeroed(outCh);
+			HeadBiasVar[h].SetNumZeroed(outCh);
+			HeadNormMean[h].SetNumZeroed(outCh);
+			HeadNormVar[h].SetNumZeroed(outCh);
+
+			auto logit = [](double p) { return FMath::Loge(p / (1.0 - p)); };
+			const double p_prior = 0.2;                     // tune 0.003–0.02
+			const double conf_bias_prior = logit(p_prior);   //-4.595
+
+			for (int a = 0; a < numAnch; ++a)
+			{
+				HeadBiases[h][a * 5 + 0] = -1.0;  // conf
+				HeadBiases[h][a * 5 + 1] = 0;              // tx
+				HeadBiases[h][a * 5 + 2] = 0;              // ty
+				HeadBiases[h][a * 5 + 3] =-1.00;              // tw
+				HeadBiases[h][a * 5 + 4] = -1.0;              // th
+			}
+
+			// Feature & error buffers
+			const int inDim = MapDims[layerID];
+			const int stride = HeadStrideSchedule[h];
+			const int pad = HeadPaddingSchedule[h];
+			const int kSize = HeadFilterDims[h];
+			const int outDim = (int)FMath::Floor((inDim + 2 * pad - kSize) / stride) + 1;
+			const int plane = outDim * outDim;
+			HeadFeatures[h].SetNumZeroed(outCh * plane);
+			HeadNetFeatures[h].SetNumZeroed(outCh * plane);
+			HeadErrors[h].SetNumZeroed(outCh * plane);
+		}
+	}
+
+	LogSigmaObj = -2.10;
+	LogSigmaCoord =-0.80;
+	LogSigmaSize =-0.8;
+
+	LogSigmaMeanObj = 0.0;
+	LogSigmaMeanCoord = 0.0;
+	LogSigmaMeanSize = 0.0;
+
+	LogSigmaVarObj = 0.0;
+	LogSigmaVarCoord = 0.0;
+	LogSigmaVarSize = 0.0;
+
+	// Optional: rolling loss tracking (for sigma updates)
+	ComponentLossEMA.Init(0.0, 3);
+}
+
+YOLO::~YOLO()
+{
+}
+
+void YOLO::Forward(TArray<double> Inputs)
+{
+	for (int i = 0; i < Inputs.Num(); ++i)
+	{
+		Features[i] = Inputs[i];
+	}
+
+	// Backbone sweep
+	for (int A = 0; A < MapCounts.Num(); ++A)
+	{
+		Convolve(A);
+		LayerNorm(A);  // writes NormMean/NormVar and uses NormGamma/NormBeta for this layer
+		ActivateAndDerive(A);
+
+		// If a YOLO head branches from this layer, pass a normalized copy to the head
+		if (AnchorHeadIDs.Contains(A))
+		{
+			const int featureStart = FeatureStart(A);
+			const int dim = MapDims[A];
+			const int layerSize = MapCounts[A] * dim * dim;
+
+			// Direct pointer to backbone layer output
+			const double* RESTRICT srcPtr = Features.GetData() + featureStart;
+
+			// Create a direct, unnormalized copy for input to YOLO head
+			TArray<double> headInput;
+			headInput.SetNumUninitialized(layerSize);
+			FMemory::Memcpy(headInput.GetData(), srcPtr, sizeof(double) * layerSize);
+
+			ConvolveHead(headInput, A);
+		}
+	}
+}
+
+TArray<double> YOLO::CreateYOLOTargetFromLabel(const TArray<double> originalLabel, int sampleIndex)
+{
+	constexpr int kOutPerAnchor = 5;   // [conf, tx, ty, tw, th]
+	const double posThresh = 0.7;
+	const double negThresh = 0.4;
+	const double ignoreValue = -1.0;
+	const double eps = 1e-9;
+
+	if (originalLabel.Num() < 4)
+		return {};
+
+	// --- Clamp label box to [0,1] normalized range ---
+	const double gx = FMath::Clamp(originalLabel[0], 0.0, 1.0);
+	const double gy = FMath::Clamp(originalLabel[1], 0.0, 1.0);
+	const double gw = FMath::Clamp(originalLabel[2], 1e-6, 1.0);
+	const double gh = FMath::Clamp(originalLabel[3], 1e-6, 1.0);
+
+	// ---- Compute total output size for all heads ----
+	int totalOutputs = 0;
+	for (int head = 0; head < Anchors.Num(); ++head)
+	{
+		const int grid = HeadFeatureDims[head];
+		const int numAnch = Anchors[head].Num();
+		totalOutputs += grid * grid * numAnch * kOutPerAnchor;
+	}
+
+	TArray<double> Targets;
+	Targets.Init(0.0, totalOutputs);
+
+	int globalOffset = 0;
+
+	// === Iterate over detection heads ===
+	for (int head = 0; head < Anchors.Num(); ++head)
+	{
+		const int grid = HeadFeatureDims[head];
+		const int numAnch = Anchors[head].Num();
+		const int headOutputs = grid * grid * numAnch * kOutPerAnchor;
+
+		// --- Grid cell position ---
+		const int cellX = FMath::Clamp(FMath::FloorToInt(gx * grid), 0, grid - 1);
+		const int cellY = FMath::Clamp(FMath::FloorToInt(gy * grid), 0, grid - 1);
+
+		TArray<double> IoUs;
+		const int bestAnchor = ComputeAnchorMatch(gw, gh, head, IoUs);
+
+		for (int a = 0; a < numAnch; ++a)
+		{
+			const double iou = FMath::Clamp(IoUs[a], 0.0, 1.0);
+			const int idx = globalOffset + ((cellY * grid + cellX) * numAnch + a) * kOutPerAnchor;
+
+			double confTarget = 0.0;
+
+			// --- Confidence target logic (no inflation, matches backward BCE) ---
+			if (iou > posThresh)
+			{
+				confTarget = iou;  // proportional to IoU, up to 1.0
+			}
+			else if (iou < negThresh)
+			{
+				confTarget = 0.0;  // negative
+			}
+			else
+			{
+				confTarget = ignoreValue;  // ignore zone
+			}
+
+			Targets[idx + 0] = confTarget;
+
+			// --- Encode positive sample for best anchor ---
+			if (a == bestAnchor && confTarget > 0.0)
+			{
+				const double aw = Anchors[head][a][0];
+				const double ah = Anchors[head][a][1];
+
+				// === Encode exactly as decode expects ===
+				// (tx,ty) are fractional cell offsets in [0,1], learned via sigmoid
+				// (tw,th) are log(anchor ratio), learned via exp
+				Targets[idx + 1] = gx * grid - cellX;             // tx target
+				Targets[idx + 2] = gy * grid - cellY;             // ty target
+				Targets[idx + 3] = log((gw / (aw + eps)));        // tw target
+				Targets[idx + 4] = log((gh / (ah + eps)));        // th target
+			}
+		}
+
+		globalOffset += headOutputs;
+	}
+
+	return Targets;
+}
+
+
+
+
+
+int YOLO::FindBestAnchor(double TargetW, double TargetH, int HeadIndex)
+{
+	if (HeadIndex < 0 || HeadIndex >= Anchors.Num())
+		return -1;
+
+	const TArray<TArray<double>>& HeadAnchors = Anchors[HeadIndex];
+	double BestArea = DBL_MAX;
+	int BestIdx = -1;
+
+	for (int i = 0; i < HeadAnchors.Num(); ++i)
+	{
+		const TArray<double>& Anchor = HeadAnchors[i];
+		double AnchorW = Anchor[0];
+		double AnchorH = Anchor[1];
+
+		// Only consider anchors that fully fit GT box
+		if (AnchorW >= TargetW && AnchorH >= TargetH)
+		{
+			double Area = AnchorW * AnchorH;
+			if (Area < BestArea)
+			{
+				BestArea = Area;
+				BestIdx = i;
+			}
+		}
+	}
+
+	// fallback: if no anchor fully fits, pick largest IoU
+	if (BestIdx == -1)
+	{
+		double BestIoU = 0.0;
+		for (int i = 0; i < HeadAnchors.Num(); ++i)
+		{
+			double AnchorW = HeadAnchors[i][0];
+			double AnchorH = HeadAnchors[i][1];
+			double InterW = FMath::Min(TargetW, AnchorW);
+			double InterH = FMath::Min(TargetH, AnchorH);
+			double IoU = (InterW * InterH) / (TargetW * TargetH + AnchorW * AnchorH - InterW * InterH + 1e-6);
+			if (IoU > BestIoU)
+			{
+				BestIoU = IoU;
+				BestIdx = i;
+			}
+		}
+	}
+
+	return BestIdx;
+}
+
+TArray<FYOLODetection> YOLO::ParseYOLOOutput(const TArray<double>& networkOutput)
+{
+	TArray<FYOLODetection> Detections;
+	constexpr int OutputsPerAnchor = 5; // [conf, tx, ty, tw, th]
+
+	auto Sigmoid = [](double x) -> double {
+		return 1.0 / (1.0 + exp(-x));
+		};
+
+	// === Use raw logits (HeadNetFeatures) rather than post-sigmoid ===
+	for (int HeadIdx = 0; HeadIdx < HeadNetFeatures.Num(); ++HeadIdx)
+	{
+		if (!HeadNetFeatures.IsValidIndex(HeadIdx))
+			continue;
+
+		const TArray<double>& HeadData = HeadNetFeatures[HeadIdx]; // <-- read logits
+		const int MapDim = HeadFeatureDims[HeadIdx];
+		if (MapDim <= 0)
+			continue;
+
+		const int NumAnch = Anchors[HeadIdx].Num();
+		const int PlaneSize = MapDim * MapDim;
+		const int Expected = NumAnch * PlaneSize * OutputsPerAnchor;
+		if (HeadData.Num() < Expected)
+			continue;
+
+		for (int a = 0; a < NumAnch; ++a)
+		{
+			const double anchorW = Anchors[HeadIdx][a][0];
+			const double anchorH = Anchors[HeadIdx][a][1];
+
+			for (int gy = 0; gy < MapDim; ++gy)
+			{
+				for (int gx = 0; gx < MapDim; ++gx)
+				{
+					const int baseIdx = ((a * PlaneSize + gy * MapDim + gx) * OutputsPerAnchor);
+
+					// Read logits directly
+					const double confLogit = HeadData[baseIdx + 0];
+					const double txLogit = HeadData[baseIdx + 1];
+					const double tyLogit = HeadData[baseIdx + 2];
+					const double twLogit = HeadData[baseIdx + 3];
+					const double thLogit = HeadData[baseIdx + 4];
+
+					// Apply activations ONCE (not double-sigmoid)
+					const double conf = Sigmoid(confLogit);
+					if (conf < 0.55)
+						continue;
+
+					const double tx = Sigmoid(txLogit);
+					const double ty = Sigmoid(tyLogit);
+					const double tw = FMath::Clamp(twLogit, -5.0, 5.0);
+					const double th = FMath::Clamp(thLogit, -5.0, 5.0);
+
+					// === Decode coordinates consistent with training ===
+					FYOLODetection Det;
+					Det.GridX = gx;
+					Det.GridY = gy;
+					Det.AnchorIndex = a;
+					Det.Confidence = conf;
+
+					// Center offsets and dimensions
+					Det.BBox.X = (gx + tx) / (double)MapDim;
+					Det.BBox.Y = (gy + ty) / (double)MapDim;
+					Det.BBox.Z = anchorW * exp(tw);
+					Det.BBox.W = anchorH * exp(th);
+
+					// Clamp to [0,1] range for safety
+					Det.BBox.X = FMath::Clamp(Det.BBox.X, 0.0, 1.0);
+					Det.BBox.Y = FMath::Clamp(Det.BBox.Y, 0.0, 1.0);
+					Det.BBox.Z = FMath::Clamp(Det.BBox.Z, 0.0, 1.0);
+					Det.BBox.W = FMath::Clamp(Det.BBox.W, 0.0, 1.0);
+
+					Detections.Add(Det);
+				}
+			}
+		}
+	}
+
+	ApplyNMS(Detections, 0.3);
+	return Detections;
+}
+
+FCIoUGradResult YOLO::ComputeCIoUGrad(FVector4 pred, FVector4 target)
+{
+	const double eps = 1e-9;
+
+	// IoU pieces
+	double Ax1 = pred.X - pred.Z / 2.0, Ay1 = pred.Y - pred.W / 2.0;
+	double Ax2 = pred.X + pred.Z / 2.0, Ay2 = pred.Y + pred.W / 2.0;
+	double Bx1 = target.X - target.Z / 2.0, By1 = target.Y - target.W / 2.0;
+	double Bx2 = target.X + target.Z / 2.0, By2 = target.Y + target.W / 2.0;
+
+	double interW = FMath::Max(0.0, FMath::Min(Ax2, Bx2) - FMath::Max(Ax1, Bx1));
+	double interH = FMath::Max(0.0, FMath::Min(Ay2, By2) - FMath::Max(Ay1, By1));
+	double interArea = interW * interH;
+	double unionArea = pred.Z * pred.W + target.Z * target.W - interArea + eps;
+	double IoU = interArea / unionArea;
+
+	// Enclosing box
+	double c_x1 = FMath::Min(Ax1, Bx1);
+	double c_y1 = FMath::Min(Ay1, By1);
+	double c_x2 = FMath::Max(Ax2, Bx2);
+	double c_y2 = FMath::Max(Ay2, By2);
+	double c2 = FMath::Pow(c_x2 - c_x1, 2.0) + FMath::Pow(c_y2 - c_y1, 2.0) + eps;
+
+	// Center distance
+	double rho2 = FMath::Pow(pred.X - target.X, 2.0) + FMath::Pow(pred.Y - target.Y, 2.0);
+
+	// Aspect-ratio term
+	double v = (4.0 / (PI * PI)) *
+		FMath::Pow(FMath::Atan(target.Z / (target.W + eps)) -
+			FMath::Atan(pred.Z / (pred.W + eps)), 2.0);
+	double alpha = v / (1.0 - IoU + v + eps);
+
+	double ciou = IoU - (rho2 / c2) - alpha * v;
+
+	// === Approximate partials ===
+	double dIoU_dx = (target.X - pred.X) * 2.0 / c2;
+	double dIoU_dy = (target.Y - pred.Y) * 2.0 / c2;
+
+	// Width/height influence IoU through area overlap—approximate by proportion
+	double dIoU_dw = (target.Z - pred.Z) / (target.Z + pred.Z + eps);
+	double dIoU_dh = (target.W - pred.W) / (target.W + pred.W + eps);
+
+	FCIoUGradResult g;
+	g.ciou = ciou;
+	g.dx = -dIoU_dx;
+	g.dy = -dIoU_dy;
+	g.dw = -dIoU_dw;
+	g.dh = -dIoU_dh;
+
+
+	double gradNorm = FMath::Sqrt(g.dx * g.dx + g.dy * g.dy + g.dw * g.dw + g.dh * g.dh) + 1e-9;
+	if (gradNorm > 1.0)
+	{
+		g.dx /= gradNorm;
+		g.dy /= gradNorm;
+		g.dw /= gradNorm;
+		g.dh /= gradNorm;
+	}
+
+	// Clamp to prevent NaNs
+	g.dx = FMath::Clamp(g.dx, -1.0, 1.0);
+	g.dy = FMath::Clamp(g.dy, -1.0, 1.0);
+	g.dw = FMath::Clamp(g.dw, -1.0, 1.0);
+	g.dh = FMath::Clamp(g.dh, -1.0, 1.0);
+
+	return g;
+}
+
+double YOLO::Softplus(double x)
+{
+	// numerically stable implementation
+	if (x > 20.0) return x;      // exp(x) would overflow anyway, softplus ~ x
+	if (x < -20.0) return exp(x); // softplus ~ exp(x) when very negative
+	return log1p(exp(x));
+}
+
+
+void YOLO::Convolve(int LayerID)
+{
+	check(MapCounts.IsValidIndex(LayerID));
+	check(MapDims.IsValidIndex(LayerID));
+	check(FilterDims.IsValidIndex(LayerID));
+	check(StrideSchedule.IsValidIndex(LayerID));
+	check(PaddingSchedule.IsValidIndex(LayerID));
+
+	const int InputCount = (LayerID > 0) ? MapCounts[LayerID - 1] : 1;
+	const int InputDim = (LayerID > 0) ? MapDims[LayerID - 1] : ImageDimPx;
+	const int FilterDim = FilterDims[LayerID];
+	const int Stride = StrideSchedule[LayerID];
+	const int Padding = PaddingSchedule[LayerID];
+	const int OutputDim = (int)FMath::FloorToInt((InputDim + 2.0 * Padding - FilterDim) / Stride) + 1;
+
+	const int FilterSize = FilterDim * FilterDim;
+	const int InputPlaneSz = InputDim * InputDim;
+	const int OutputPlaneSz = OutputDim * OutputDim;
+
+	const int InputOffset = (LayerID > 0) ? FeatureStart(LayerID - 1) : 0;
+	const int FeatureOffset = FeatureStart(LayerID);
+	const int BiasOffset = BiasStart(LayerID);
+	const int FilterOffset = FilterStart(LayerID);
+	const int numOutMaps = MapCounts[LayerID];
+
+	const double* RESTRICT inFeat = Features.GetData();
+	const double* RESTRICT filt = Filters.GetData();
+	double* RESTRICT outNet = NetFeatures.GetData();
+	const double* RESTRICT biasPtr = Bias.GetData();
+
+	// --- Standard convolution (no per-channel LCN) ---
+	ParallelFor(numOutMaps, [&](int out_map)
+		{
+			const int outMapBase = FeatureOffset + out_map * OutputPlaneSz;
+			const int filterBase = FilterOffset + out_map * InputCount * FilterSize;
+			const double b = biasPtr[BiasOffset + out_map];
+
+			for (int oy = 0; oy < OutputDim; ++oy)
+			{
+				const int base_input_y = oy * Stride - Padding;
+				for (int ox = 0; ox < OutputDim; ++ox)
+				{
+					const int base_input_x = ox * Stride - Padding;
+					double sum = 0.0;
+
+					for (int in_map = 0; in_map < InputCount; ++in_map)
+					{
+						const int inMapBase = InputOffset + in_map * InputPlaneSz;
+						const int fMapBase = filterBase + in_map * FilterSize;
+
+						for (int fy = 0; fy < FilterDim; ++fy)
+						{
+							const int iy = base_input_y + fy;
+							if ((unsigned)iy >= (unsigned)InputDim) continue;
+
+							for (int fx = 0; fx < FilterDim; ++fx)
+							{
+								const int ix = base_input_x + fx;
+								if ((unsigned)ix >= (unsigned)InputDim) continue;
+
+								sum += inFeat[inMapBase + iy * InputDim + ix] * filt[fMapBase + fy * FilterDim + fx];
+							}
+						}
+					}
+					outNet[outMapBase + oy * OutputDim + ox] = sum + b;
+				}
+			}
+		});
+}
+
+void YOLO::LayerNorm(int LayerID)
+{
+	const int featureBase = FeatureStart(LayerID);
+	const int biasBase = BiasStart(LayerID);
+	const int maps = MapCounts[LayerID];
+	const int mapArea = MapDims[LayerID] * MapDims[LayerID];
+	const double eps = 1e-4;
+
+	const double* RESTRICT net = NetFeatures.GetData() + featureBase;
+	double* RESTRICT out = NormFeatures.GetData() + featureBase;
+	const double* RESTRICT g = NormGamma.GetData() + biasBase;
+	const double* RESTRICT b = NormBeta.GetData() + biasBase;
+
+	for (int c = 0; c < maps; ++c)
+	{
+		const double* RESTRICT x = net + c * mapArea;
+		double* RESTRICT y = out + c * mapArea;
+		const double gamma = g[c], beta = b[c];
+
+		double mean = 0.0;
+		for (int i = 0; i < mapArea; ++i) mean += x[i];
+		mean /= mapArea;
+
+		double var = 0.0;
+		for (int i = 0; i < mapArea; ++i) { const double d = x[i] - mean; var += d * d; }
+		var /= mapArea;
+
+		NormMean[biasBase + c] = mean;
+		NormVar[biasBase + c] = var;
+
+		const double invStd = 1.0 / FMath::Sqrt(var + eps);
+
+		for (int i = 0; i < mapArea; ++i)
+		{
+			const double xhat = (x[i] - mean) * invStd;
+			y[i] = xhat * gamma + beta;
+		}
+	}
+}
+
+int YOLO::ComputeAnchorMatch(double gw, double gh, int headIdx, TArray<double>& IoUs)
+{
+	IoUs.SetNum(Anchors[headIdx].Num());
+	double bestIoU = 0.0;
+	int bestIdx = -1;
+
+	for (int i = 0; i < Anchors[headIdx].Num(); ++i)
+	{
+		const double aw = Anchors[headIdx][i][0];
+		const double ah = Anchors[headIdx][i][1];
+		const double interW = FMath::Min(gw, aw);
+		const double interH = FMath::Min(gh, ah);
+		const double interArea = interW * interH;
+		const double unionArea = gw * gh + aw * ah - interArea;
+		const double iou = interArea / (unionArea + 1e-9);
+		IoUs[i] = iou;
+
+		if (iou > bestIoU)
+		{
+			bestIoU = iou;
+			bestIdx = i;
+		}
+	}
+	return bestIdx;
+}
+
+void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
+{
+	constexpr int kOutPerAnchor = 5; // [conf, tx, ty, tw, th]
+
+	const double wObj = 5.0;
+	const double wCoord = 3.0;
+	const double wSize = 2.0;
+
+	const double clipLogit = 5.0; // clamp tw/th logits before exp
+
+	int globalTgtOffset = 0;
+
+	double* RESTRICT featuresPtr = Features.GetData();
+	double* RESTRICT errorsPtr = Errors.GetData();
+
+	for (int head = 0; head < HeadFeatures.Num(); ++head)
+	{
+		const int layerID = AnchorHeadIDs[head];
+		const int prevCount = MapCounts[layerID];
+		const int prevDim = MapDims[layerID];
+		const int prevPlane = prevDim * prevDim;
+		const int inputOffset = FeatureStart(layerID);
+
+		const int numAnch = Anchors[head].Num();
+		const int grid = HeadFeatureDims[head];
+		const int plane = grid * grid;
+		const int outCh = numAnch * kOutPerAnchor;
+
+		const int K = HeadFilterDims[head];
+		const int stride = HeadStrideSchedule[head];
+		const int pad = HeadPaddingSchedule[head];
+
+		// Buffers
+		const double* RESTRICT headOut = HeadFeatures[head].GetData();       // ((a*plane + p)*5 + comp); conf/tx/ty post-sigmoid, tw/th linear
+		const double* RESTRICT headNet = HeadNetFeatures[head].GetData();     // raw logits for all 5 comps (net before activation)
+		double* RESTRICT headErr = HeadErrors[head].GetData();
+		double* RESTRICT headDW = HeadDeltas[head].GetData();
+		double* RESTRICT headDB = HeadBiasDeltas[head].GetData();
+		const double* RESTRICT headW = HeadFilters[head].GetData();
+
+		if (!headOut || !headNet || !headErr || !headDW || !headDB || !headW) {
+			globalTgtOffset += plane * numAnch * kOutPerAnchor;
+			continue;
+		}
+
+		// ===== A) Local gradients at head outputs (per-pixel/channel) =====
+		for (int a = 0; a < numAnch; ++a)
+		{
+			for (int comp = 0; comp < kOutPerAnchor; ++comp)
+			{
+				const int oc = a * kOutPerAnchor + comp;
+				double biasSum = 0.0;
+
+				for (int p = 0; p < plane; ++p)
+				{
+					const int interIdx = ((a * plane + p) * kOutPerAnchor) + comp;
+					const int chIdx = oc * plane + p;
+
+					
+					const int tgt_base = globalTgtOffset + p * (numAnch * kOutPerAnchor) + a * kOutPerAnchor;
+
+
+					if (!Targets.IsValidIndex(tgt_base + 4)) { headErr[chIdx] = 0.0; continue; }
+
+					const double t_conf = Targets[tgt_base + 0];
+
+					if (t_conf < -0.5) { headErr[chIdx] = 0.0; continue; }
+
+					const bool isPos = (t_conf > 0.0);
+
+
+					const double t_tx = Targets[tgt_base + 1];
+					const double t_ty = Targets[tgt_base + 2];
+					const double t_tw = Targets[tgt_base + 3];
+					const double t_th = Targets[tgt_base + 4];
+
+					const int base = (a * plane + p) * kOutPerAnchor;
+					const double tx = headOut[base + 1];
+					const double ty = headOut[base + 2];
+					const double tw = FMath::Clamp(headNet[base + 3], -clipLogit, clipLogit);
+					const double th = FMath::Clamp(headNet[base + 4], -clipLogit, clipLogit); 
+
+					const int G = grid;
+					const int cellX = (p % G);
+					const int cellY = (p / G);
+					const double aw = Anchors[head][a][0];
+					const double ah = Anchors[head][a][1];
+
+					const double bx = (cellX + tx) / (double)G;
+					const double by = (cellY + ty) / (double)G;
+					const double bw = aw * FMath::Exp(tw);
+					const double bh = ah * FMath::Exp(th);
+
+					const double gx = (cellX + t_tx) / (double)G;
+					const double gy = (cellY + t_ty) / (double)G;
+					const double gw = aw * FMath::Exp(t_tw);
+					const double gh = ah * FMath::Exp(t_th);
+
+					const double iou = FMath::Clamp(ComputeIoU(FVector4(bx, by, bw, bh),
+						FVector4(gx, gy, gw, gh)), 0.0, 1.0);
+
+					double grad = 0.0;
+
+					if (comp == 0)
+					{
+						
+						const double logit = headNet[interIdx]; 
+						const double y = 1.0 / (1.0 + FMath::Exp(-logit));
+						const double t = isPos ? 1.0 : 0.0;
+
+						
+						const double gamma = 2.0;
+						const double focal = FMath::Pow(1.0 - FMath::Abs(y - t), gamma);
+
+					
+						if (isPos) {
+							const double iouBoost = 1.0 + 0.5 * iou;      
+							grad = (y - t) * wObj * focal * 1.5 * iouBoost;
+						}
+						else {
+							grad = (y - t) * wObj * focal * 0.15;         
+						}
+					}
+					else if (comp >= 1 && comp <= 4)
+					{
+						if (!isPos) { headErr[chIdx] = 0.0; continue; }
+
+				
+						const double dbx = (gx - bx);
+						const double dby = (gy - by);
+						const double dbw = (gw - bw);
+						const double dbh = (gh - bh);
+
+					
+						const double d_bx_d_tx = 1.0 / (double)G; // tx,ty are already post-sigmoid offsets
+						const double d_by_d_ty = 1.0 / (double)G;
+						const double d_bw_d_tw = bw;              // d(aw*exp(tw)) = bw
+						const double d_bh_d_th = bh;              // 
+						const double logit = headNet[interIdx];
+
+						switch (comp)
+						{
+							case 1:
+							{
+								// tx gradient: include sigmoid'(logit) because training uses logits for tx
+								const double logit_tx = headNet[base + 1];
+								const double sig = 1.0 / (1.0 + FMath::Exp(-logit_tx));
+								const double sigp = sig * (1.0 - sig);
+								grad = wCoord * dbx * d_bx_d_tx * sigp;
+								break;
+							}
+							case 2:
+							{
+								// ty gradient: include sigmoid'(logit)
+								const double logit_ty = headNet[base + 2];
+								const double sig = 1.0 / (1.0 + FMath::Exp(-logit_ty));
+								const double sigp = sig * (1.0 - sig);
+								grad = wCoord * dby * d_by_d_ty * sigp;
+								break;
+							}
+							case 3:
+								grad = wSize * dbw * d_bw_d_tw; // tw uses exp(logit), already correct
+								break;
+							case 4:
+								grad = wSize * dbh * d_bh_d_th; // th same
+								break;
+						}
+
+						// Mild IoU-aware upweighting
+						grad *= (1.0 + 0.5 * iou); // <= 1.5x
+					}
+
+					headErr[chIdx] = grad;
+					biasSum += grad;
+				}
+
+				// bias grad: average over spatial positions
+				headDB[oc] += biasSum / (double)plane;
+			}
+		}
+
+		// ===== B) Convolution weight gradients (standard conv backward) =====
+		for (int oc = 0; oc < outCh; ++oc)
+		{
+			const int errBase = oc * plane;
+			for (int ic = 0; ic < prevCount; ++ic)
+				for (int ky = 0; ky < K; ++ky)
+					for (int kx = 0; kx < K; ++kx)
+					{
+						double acc = 0.0;
+						for (int oy = 0; oy < grid; ++oy)
+						{
+							const int in_y = oy * stride - pad + ky;
+							if ((unsigned)in_y >= (unsigned)prevDim) continue;
+
+							for (int ox = 0; ox < grid; ++ox)
+							{
+								const int in_x = ox * stride - pad + kx;
+								if ((unsigned)in_x >= (unsigned)prevDim) continue;
+
+								const int inIdx = inputOffset + ic * prevPlane + in_y * prevDim + in_x;
+								const int errIdx = errBase + oy * grid + ox;
+								acc += featuresPtr[inIdx] * headErr[errIdx];
+							}
+						}
+						const int wIdx = (oc * prevCount + ic) * (K * K) + ky * K + kx;
+						headDW[wIdx] += acc / plane;
+					}
+		}
+
+		// ===== C) Backprop to previous feature map (transpose conv) =====
+		TArray<double> prevGrad; prevGrad.Init(0.0, prevCount * prevPlane);
+		double* RESTRICT pg = prevGrad.GetData();
+
+		for (int oc = 0; oc < outCh; ++oc)
+		{
+			const int errBase = oc * plane;
+			for (int oy = 0; oy < grid; ++oy)
+			{
+				const int in_y0 = oy * stride - pad;
+				for (int ox = 0; ox < grid; ++ox)
+				{
+					const int in_x0 = ox * stride - pad;
+					const double derr = headErr[errBase + oy * grid + ox];
+					if (FMath::IsNearlyZero(derr, 1e-12)) continue;
+
+					for (int ic = 0; ic < prevCount; ++ic)
+						for (int ky = 0; ky < K; ++ky)
+						{
+							const int iy = in_y0 + ky;
+							if ((unsigned)iy >= (unsigned)prevDim) continue;
+
+							for (int kx = 0; kx < K; ++kx)
+							{
+								const int ix = in_x0 + kx;
+								if ((unsigned)ix >= (unsigned)prevDim) continue;
+
+								const int inIdx = ic * prevPlane + iy * prevDim + ix;
+								const int wIdx = (oc * prevCount + ic) * (K * K) + ky * K + kx;
+								pg[inIdx] += derr * headW[wIdx];
+							}
+						}
+				}
+			}
+		}
+
+		// ===== D) Optional: undo per-head normalization effect =====
+		double* RESTRICT g = pg;
+		//if (HeadNormMean.IsValidIndex(head) && HeadNormVar.IsValidIndex(head))
+		//{
+		//	const TArray<double>& means = HeadNormMean[head];
+		//	const TArray<double>& invStds = HeadNormVar[head];
+		//	const double mixAlpha = 0.85;
+
+		//	for (int c = 0; c < prevCount; ++c)
+		//	{
+		//		const double mean = means.IsValidIndex(c) ? means[c] : 0.0;
+		//		const double invStd = invStds.IsValidIndex(c) ? invStds[c] : 1.0;
+
+		//		const double* RESTRICT x = featuresPtr + inputOffset + c * prevPlane;
+		//		double* RESTRICT gc = pg + c * prevPlane;
+
+		//		double sum_g = 0.0;
+		//		double sum_gx = 0.0;
+		//		for (int i = 0; i < prevPlane; ++i)
+		//		{
+		//			const double xm = x[i] - mean;
+		//			sum_g += gc[i];
+		//			sum_gx += gc[i] * xm;
+		//		}
+
+		//		const double invN = 1.0 / (double)prevPlane;
+		//		for (int i = 0; i < prevPlane; ++i)
+		//		{
+		//			const double xm = x[i] - mean;
+		//			const double term = (prevPlane * gc[i]) - sum_g - xm * invStd * sum_gx;
+		//			gc[i] = invStd * invN * term * mixAlpha;
+		//		}
+		//	}
+		//	g = pg;
+		//}
+
+		// ===== E) Accumulate into global Errors buffer for this stem layer =====
+		if (Errors.Num() < inputOffset + prevCount * prevPlane)
+			Errors.SetNumZeroed(inputOffset + prevCount * prevPlane, false);
+
+		double* RESTRICT dst = errorsPtr + inputOffset;
+		for (int i = 0, n = prevCount * prevPlane; i < n; ++i)
+			dst[i] += g[i];
+
+		// Advance to next head's target slice
+		globalTgtOffset += plane * numAnch * kOutPerAnchor;
+	}
+}
+
+
+
+bool YOLO::SaveNetwork()
+{
+	FString FilePath = TEXT("C:\\Users\\wmm61\\OneDrive\\Desktop\\AI_DataSets\\YOLONetworkSave.bin");
+	TUniquePtr<FArchive> FileWriter = TUniquePtr<FArchive>(IFileManager::Get().CreateFileWriter(*FilePath));
+
+	if (!FileWriter)
+	{
+		UE_LOG(LogTemp, Error, TEXT("Failed to create save file: %s"), *FilePath);
+		return false;
+	}
+
+	try
+	{
+		// === Basic training info ===
+		*FileWriter << Iteration;
+		*FileWriter << BatchIteration;
+		*FileWriter << LearningRate;
+
+		// === Helper lambdas ===
+		auto WriteIntArray = [&](const TArray<int>& Arr)
+			{
+				int32 Count = Arr.Num();
+				*FileWriter << Count;
+				if (Count > 0)
+					FileWriter->Serialize((void*)Arr.GetData(), Count * sizeof(int));
+			};
+
+		auto WriteDoubleArray = [&](const TArray<double>& Arr)
+			{
+				int32 Count = Arr.Num();
+				*FileWriter << Count;
+				if (Count > 0)
+					FileWriter->Serialize((void*)Arr.GetData(), Count * sizeof(double));
+			};
+
+		auto WriteDoubleArray2D = [&](const TArray<TArray<double>>& Outer)
+			{
+				int32 OuterCount = Outer.Num();
+				*FileWriter << OuterCount;
+				for (int32 i = 0; i < OuterCount; i++)
+					WriteDoubleArray(Outer[i]);
+			};
+
+		// === Architecture essentials ===
+		WriteIntArray(MapCounts);
+		WriteIntArray(MapDims);
+		WriteIntArray(FilterDims);
+		WriteIntArray(HeadStrideSchedule);
+		WriteIntArray(HeadPaddingSchedule);
+		WriteIntArray(HeadFilterDims);
+		WriteIntArray(AnchorHeadIDs);
+
+		// === Core learnable parameters ===
+		WriteDoubleArray(Filters);
+		WriteDoubleArray(Bias);
+		WriteDoubleArray(NormGamma);
+		WriteDoubleArray(NormBeta);
+
+		// === Adam-like optimizer state (if used) ===
+		WriteDoubleArray(BiasMean);
+		WriteDoubleArray(BiasVar);
+		WriteDoubleArray(DeltaMean);
+		WriteDoubleArray(DeltaVar);
+		WriteDoubleArray(NormGammaMean);
+		WriteDoubleArray(NormGammaVar);
+		WriteDoubleArray(NormBetaMean);
+		WriteDoubleArray(NormBetaVar);
+
+		// === YOLO heads ===
+		WriteDoubleArray2D(HeadFilters);
+		WriteDoubleArray2D(HeadBiases);
+
+		FileWriter->Close();
+
+		return true;
+	}
+	catch (...)
+	{
+
+		return false;
+	}
+}
+
+bool YOLO::LoadNetwork()
+{
+	FString FilePath = TEXT("C:\\Users\\wmm61\\OneDrive\\Desktop\\AI_DataSets\\YOLONetworkSave.bin");
+	TUniquePtr<FArchive> FileReader = TUniquePtr<FArchive>(IFileManager::Get().CreateFileReader(*FilePath));
+
+	if (!FileReader)
+	{
+		return false;
+	}
+
+	try
+	{
+		// === Basic training info ===
+		*FileReader << Iteration;
+		*FileReader << BatchIteration;
+		*FileReader << LearningRate;
+
+		// === Helper lambdas ===
+		auto ReadIntArray = [&](TArray<int>& Arr)
+			{
+				int32 Count = 0;
+				*FileReader << Count;
+				if (Count <= 0)
+				{
+					Arr.Empty();
+					return;
+				}
+				Arr.SetNumUninitialized(Count);
+				FileReader->Serialize(Arr.GetData(), Count * sizeof(int));
+			};
+
+		auto ReadDoubleArray = [&](TArray<double>& Arr)
+			{
+				int32 Count = 0;
+				*FileReader << Count;
+				if (Count <= 0)
+				{
+					Arr.Empty();
+					return;
+				}
+				Arr.SetNumUninitialized(Count);
+				FileReader->Serialize(Arr.GetData(), Count * sizeof(double));
+			};
+
+		auto ReadDoubleArray2D = [&](TArray<TArray<double>>& Outer)
+			{
+				int32 OuterCount = 0;
+				*FileReader << OuterCount;
+				if (OuterCount <= 0)
+				{
+					Outer.Empty();
+					return;
+				}
+
+				Outer.SetNum(OuterCount);
+				for (int32 i = 0; i < OuterCount; i++)
+					ReadDoubleArray(Outer[i]);
+			};
+
+		// === Architecture essentials ===
+		ReadIntArray(MapCounts);
+		ReadIntArray(MapDims);
+		ReadIntArray(FilterDims);
+		ReadIntArray(HeadStrideSchedule);
+		ReadIntArray(HeadPaddingSchedule);
+		ReadIntArray(HeadFilterDims);
+		ReadIntArray(AnchorHeadIDs);
+
+		// === Core learnable parameters ===
+		ReadDoubleArray(Filters);
+		ReadDoubleArray(Bias);
+		ReadDoubleArray(NormGamma);
+		ReadDoubleArray(NormBeta);
+
+		// === Adam-like optimizer state (if used) ===
+		ReadDoubleArray(BiasMean);
+		ReadDoubleArray(BiasVar);
+		ReadDoubleArray(DeltaMean);
+		ReadDoubleArray(DeltaVar);
+		ReadDoubleArray(NormGammaMean);
+		ReadDoubleArray(NormGammaVar);
+		ReadDoubleArray(NormBetaMean);
+		ReadDoubleArray(NormBetaVar);
+
+		// === YOLO heads ===
+		ReadDoubleArray2D(HeadFilters);
+		ReadDoubleArray2D(HeadBiases);
+
+		FileReader->Close();
+
+		return true;
+	}
+	catch (...)
+	{
+
+		return false;
+	}
+}
+
+void YOLO::ActivateAndDerive(int LayerID)
+{
+	const int numMaps = MapCounts[LayerID];
+	const int dim = MapDims[LayerID];
+	const int mapArea = dim * dim;
+	const int layerBase = FeatureStart(LayerID);
+
+	const bool isOutput = (LayerID == MapCounts.Num() - 1);
+	const int outputsPerAnchor = 5;
+
+	double* RESTRICT featPtr = Features.GetData();
+	double* RESTRICT derivPtr = Derivatives.GetData();
+	const double* RESTRICT normPtr = NormFeatures.GetData() + layerBase;
+	const double* RESTRICT netPtr = NetFeatures.GetData() + layerBase; // only needed for Mish
+
+	auto Sigmoid = [](double x) { return 1.0 / (1.0 + FMath::Exp(-x)); };
+
+	for (int a = 0; a < numMaps; ++a)
+	{
+		const int base = layerBase + a * mapArea;
+		double* RESTRICT f = featPtr + base;
+		double* RESTRICT d = derivPtr + base;
+		const double* RESTRICT n = normPtr + a * mapArea;
+		const double* RESTRICT pre = netPtr + a * mapArea;
+
+		//if (isOutput)
+		//{
+		//	const int comp = a % outputsPerAnchor; // 0=conf,1=tx,2=ty,3=tw,4=th
+		//	if (comp < 3)
+		//	{
+		//		for (int i = 0; i < mapArea; ++i)
+		//		{
+		//			const double v = Sigmoid(n[i]);
+		//			f[i] = v;
+		//			d[i] = v * (1.0 - v);
+		//		}
+		//	}
+		//	else
+		//	{
+		//		for (int i = 0; i < mapArea; ++i)
+		//		{
+		//			f[i] = n[i];
+		//			d[i] = 1.0;
+		//		}
+		//	}
+		//}
+		//else
+		//{
+			switch (ActivationFunctionSchedule[LayerID])
+			{
+			case 0: // Tanh
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double v = FMath::Tanh(n[i]);
+					f[i] = v;
+					d[i] = 1.0 - v * v;
+				}
+				break;
+			case 1: // Sigmoid
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double v = Sigmoid(n[i]);
+					f[i] = v;
+					d[i] = v * (1.0 - v);
+				}
+				break;
+			case 2: // ELU
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double x = n[i];
+					if (x > 0.0) { f[i] = x; d[i] = 1.0; }
+					else { const double e = FMath::Exp(x); f[i] = ELUConst * (e - 1.0); d[i] = ELUConst * e; }
+				}
+				break;
+			case 3: // Leaky ReLU
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double x = n[i];
+					if (x > 0.0) { f[i] = x; d[i] = 1.0; }
+					else { f[i] = ReLUConst * x; d[i] = ReLUConst; }
+				}
+				break;
+			case 4: // Mish-like (v = pre * sigmoid(pre))
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double x = n[i] * 0.85;
+					const double s = 1.0 / (1.0 + FMath::Exp(-x));
+					f[i] = x * s;
+					d[i] = s * (1.0 + x * (1.0 - s));
+				}
+				break;
+			case 5: // Serf Sinusoidal Error Function
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double softplus = (pre[i] > 20.0) ? pre[i] : log1p(exp(pre[i]));
+					const double inner = erf(softplus);
+
+					f[i] = pre[i] * inner;
+
+					const double term = (2.0 / sqrt(PI)) * exp(-softplus * softplus) * Sigmoid(pre[i]);
+					d[i] = erf(softplus) + pre[i] * term;
+				}
+				break;
+			case 6: //GELU
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double SqrtOverPi = sqrt(2.0 / PI);
+					const double Inner = SqrtOverPi * (n[i] + 0.044715 * FMath::Pow(n[i], 3.0));
+
+					f[i] = 0.5 * n[i] * (1.0 + FMath::Tanh(Inner));
+
+					double Inner2 = 1.0 - FMath::Tanh(Inner) * FMath::Tanh(Inner);
+					double Term1 = 0.5 * (1.0 + FMath::Tanh(Inner));
+					double Term2 = 0.5 * pre[i] * Inner2 * SqrtOverPi * (1.0 + 3.0 * 0.044715 * FMath::Pow(n[i], 2.0));
+
+					d[i] = Term1 + Term2;
+				}
+
+				break;
+			case 7: //SiLU
+				for (int i = 0; i < mapArea; ++i)
+				{
+					const double Sig = 1.0 / (1.0 + exp(-n[i]));
+
+					f[i] = Sig * n[i];
+
+					d[i] = Sig + n[i] * Sig * (1.0 - Sig);
+				}
+
+				break;
+			default: // Linear
+				for (int i = 0; i < mapArea; ++i)
+				{
+					f[i] = n[i];
+					d[i] = 1.0;
+				}
+				break;
+			}
+		}
+	//}
+}
+
+double YOLO::ComputeCIoU(FVector4 pred, FVector4 target)
+{
+	// Boxes: X,Y=center, Z=width, W=height
+	const double eps = 1e-9;
+
+	// IoU
+	const double IoU = ComputeIoU(pred, target);
+
+	// Enclosing box
+	double c_x1 = FMath::Min(pred.X - pred.Z / 2.0, target.X - target.Z / 2.0);
+	double c_y1 = FMath::Min(pred.Y - pred.W / 2.0, target.Y - target.W / 2.0);
+	double c_x2 = FMath::Max(pred.X + pred.Z / 2.0, target.X + target.Z / 2.0);
+	double c_y2 = FMath::Max(pred.Y + pred.W / 2.0, target.Y + target.W / 2.0);
+
+	double c2 = FMath::Pow(c_x2 - c_x1, 2.0) + FMath::Pow(c_y2 - c_y1, 2.0) + eps;
+
+	// Center distance
+	double rho2 = FMath::Pow(pred.X - target.X, 2.0) + FMath::Pow(pred.Y - target.Y, 2.0);
+
+	// Aspect ratio consistency
+	double v = (4.0 / (PI * PI)) * FMath::Pow(FMath::Atan(target.Z / (target.W + eps)) -
+		FMath::Atan(pred.Z / (pred.W + eps)), 2.0);
+	double alpha = v / (1.0 - IoU + v + eps);
+
+	return IoU - (rho2 / c2) - alpha * v;
+}
+
+int YOLO::FeatureStart(int LayerID)
+{
+	int RetVal = 0;
+	int A = 0;
+
+	while (A < LayerID)
+	{
+		RetVal += MapCounts[A] * MapDims[A] * MapDims[A];
+
+		A++;
+	}
+
+	return RetVal;
+}
+
+int YOLO::BiasStart(int LayerID)
+{
+	int RetVal = 0;
+	int A = 0;
+
+	while (A < LayerID)
+	{
+		RetVal += MapCounts[A];
+
+		A++;
+	}
+
+	return RetVal;
+}
+
+int YOLO::FilterStart(int LayerID)
+{
+	int RetVal = 0;
+	int A = 0;
+
+	while (A < LayerID)
+	{
+		if (A == 0)
+		{
+			RetVal += MapCounts[A] * FilterDims[A] * FilterDims[A];
+		}
+		else
+		{
+			RetVal += MapCounts[A] * MapCounts[A - 1] * FilterDims[A] * FilterDims[A];
+		}
+
+
+		A++;
+	}
+
+	return RetVal;
+}
+
+void YOLO::Backward(const TArray<double>& Inputs, const TArray<double>& Outputs)
+{
+	const int lastLayerID = MapCounts.Num() - 1;
+
+	ZeroGradients(false);
+
+	// Recompute forward (ensures NormMean/Var, NormGamma/Beta and head inputs are fresh)
+	Forward(Inputs);
+
+	// Heads inject gradients (also backprop through NormalizeSet inside YOLOHeadBackward)
+	YOLOHeadBackward(Outputs);
+
+	// Top-down conv sweep
+	for (int layerID = lastLayerID; layerID >= 0; --layerID)
+	{
+		const int numMaps = MapCounts[layerID];
+		const int dim = MapDims[layerID];
+		const int layerSize = numMaps * dim * dim;
+		const int layerStart = FeatureStart(layerID);
+
+		double* RESTRICT errorsPtr = Errors.GetData() + layerStart;
+
+		// Copy current seed
+		TArray<double> topDownSeed;
+		topDownSeed.SetNumUninitialized(layerSize);
+		FMemory::Memcpy(topDownSeed.GetData(), errorsPtr, sizeof(double) * layerSize);
+
+		// LayerNorm backward:
+		// - if this layer spawns a head: only compute param grads (no input-grad) to avoid double norm
+		// - else: full LN backward (param grads + input-grad)
+
+		TArray<double> gradAfterNorm;
+
+		//if (AnchorHeadIDs.Contains(layerID))
+		//{
+		//	gradAfterNorm = topDownSeed;
+		//	LayerNormBackward(
+		//		MoveTemp(topDownSeed), layerID, false);
+		//	
+		//}
+		//else
+		//{
+		//	gradAfterNorm = LayerNormBackward(
+		//		MoveTemp(topDownSeed), layerID, true);
+		//}
+
+		gradAfterNorm = LayerNormBackward(MoveTemp(topDownSeed), layerID, true);
+
+		double* RESTRICT derivPtr = Derivatives.GetData() + layerStart;
+		for (int i = 0; i < layerSize; ++i)
+			errorsPtr[i] += gradAfterNorm[i] * derivPtr[i];
+
+		// dL/dW and dL/dBias for this conv layer
+		GradientsWRTFilters(layerID);
+
+		// Propagate to previous layer
+		TempGradientsWRTInputs = GradientsWRTInputs(layerID);
+		if (layerID > 0)
+		{
+			const int prevSize = MapCounts[layerID - 1] * MapDims[layerID - 1] * MapDims[layerID - 1];
+			const int prevStart = FeatureStart(layerID - 1);
+
+			if (Errors.Num() < prevStart + prevSize)
+				Errors.SetNumZeroed(prevStart + prevSize, false);
+
+			double* RESTRICT prevErr = Errors.GetData() + prevStart;
+			const double* RESTRICT tmp = TempGradientsWRTInputs.GetData();
+
+			for (int i = 0; i < prevSize; ++i)
+				prevErr[i] += tmp[i];
+		}
+	}
+
+	// Optimizer step (batched)
+		ApplyGradientDeltas();
+
+	Iteration++;
+}
+void YOLO::GradientsWRTFilters(int LayerID)
+{
+	const int inCount = (LayerID > 0) ? MapCounts[LayerID - 1] : 1;
+	const int inDim = (LayerID > 0) ? MapDims[LayerID - 1] : ImageDimPx;
+	const int outDim = MapDims[LayerID];
+	const int kDim = FilterDims[LayerID];
+	const int stride = StrideSchedule[LayerID];
+	const int pad = PaddingSchedule[LayerID];
+
+	const int inPlane = inDim * inDim;
+	const int outPlane = outDim * outDim;
+	const int kSize = kDim * kDim;
+
+	const int inBase = (LayerID > 0) ? FeatureStart(LayerID - 1) : 0;
+	const int outBase = FeatureStart(LayerID);
+	const int filtBase = FilterStart(LayerID);
+	const int biasBase = BiasStart(LayerID);
+
+	const int outMaps = MapCounts[LayerID];
+
+	const double* RESTRICT inFeat = Features.GetData();
+	const double* RESTRICT errPtr = Errors.GetData();
+	double* RESTRICT deltaPtr = Deltas.GetData();
+	double* RESTRICT biasDeltaPtr = BiasDelta.GetData();
+
+	// Bias grads
+	for (int omap = 0; omap < outMaps; ++omap)
+	{
+		const int eBase = outBase + omap * outPlane;
+		double sum = 0.0;
+		for (int i = 0; i < outPlane; ++i) sum += errPtr[eBase + i];
+		biasDeltaPtr[biasBase + omap] += sum / (double)outPlane;
+	}
+
+	// Filter grads
+	for (int omap = 0; omap < outMaps; ++omap)
+	{
+		const int eBase = outBase + omap * outPlane;
+		const int fOMapBase = filtBase + omap * inCount * kSize;
+
+		for (int imap = 0; imap < inCount; ++imap)
+		{
+			const int inMapBase = inBase + imap * inPlane;
+			const int fBase = fOMapBase + imap * kSize;
+
+			for (int ky = 0; ky < kDim; ++ky)
+			{
+				for (int kx = 0; kx < kDim; ++kx)
+				{
+					double acc = 0.0;
+
+					for (int oy = 0; oy < outDim; ++oy)
+					{
+						const int iy = oy * stride - pad + ky;
+						if ((unsigned)iy >= (unsigned)inDim) continue;
+
+						const int eRow = eBase + oy * outDim;
+
+						for (int ox = 0; ox < outDim; ++ox)
+						{
+							const int ix = ox * stride - pad + kx;
+							if ((unsigned)ix >= (unsigned)inDim) continue;
+
+							acc += errPtr[eRow + ox] * inFeat[inMapBase + iy * inDim + ix];
+						}
+					}
+
+					deltaPtr[fBase + ky * kDim + kx] += acc;
+				}
+			}
+		}
+	}
+}
+
+void YOLO::ApplyGradientDeltas()
+{
+	const double eps = 1e-8;
+	const double AdamWDecay = 1e-2;   // weight decay for weights ONLY
+	const int numLayers = MapCounts.Num();
+	const double LRMax = 0.0002;	
+	const double LRMin = 0.000001;
+	const double LRMaxHead = 5e-4;
+	const double LRMinHead = 0.000001;
+	const int CycleCount = 250;
+
+	GEngine->AddOnScreenDebugMessage(200, 5.f, FColor::Orange, FString("HEAD 0 DELTAS: ") + FString::SanitizeFloat(static_cast<double>(GetMean(HeadDeltas[0]))));
+	GEngine->AddOnScreenDebugMessage(201, 5.f, FColor::Orange, FString("HEAD 1 DELTAS: ") + FString::SanitizeFloat(static_cast<double>(GetMean(HeadDeltas[1]))));
+	GEngine->AddOnScreenDebugMessage(202, 5.f, FColor::Orange, FString("HEAD 2 DELTAS: ") + FString::SanitizeFloat(static_cast<double>(GetMean(HeadDeltas[2]))));
+
+	// =====================================================================
+	// === (A) GLOBAL GRADIENT CLIPPING ====================================
+	// =====================================================================
+	double globalNorm = 0.0;
+
+	auto AccumulateNorm = [&](const TArray<double>& arr)
+		{
+			const double* ptr = arr.GetData();
+			for (int i = 0; i < arr.Num(); ++i)
+				globalNorm += ptr[i] * ptr[i];
+		};
+
+	//// Backbone
+	AccumulateNorm(Deltas);
+	AccumulateNorm(BiasDelta);
+	AccumulateNorm(NormGammaDelta);
+	AccumulateNorm(NormBetaDelta);
+
+	// Heads
+	for (int h = 0; h < HeadDeltas.Num(); ++h)
+	{
+		AccumulateNorm(HeadDeltas[h]);
+		AccumulateNorm(HeadBiasDeltas[h]);
+	}
+
+	globalNorm = sqrt(globalNorm);
+	const double clipNorm = 1.0;  // Tune: 0.5–2.0 typical
+
+	if (globalNorm > clipNorm)
+	{
+		const double scale = clipNorm / globalNorm;
+
+		auto ScaleBuf = [&](TArray<double>& arr)
+			{
+				double* ptr = arr.GetData();
+				for (int i = 0; i < arr.Num(); ++i)
+					ptr[i] *= scale;
+			};
+
+		ScaleBuf(Deltas);
+		ScaleBuf(BiasDelta);
+		ScaleBuf(NormGammaDelta);
+		ScaleBuf(NormBetaDelta);
+
+		for (int h = 0; h < HeadDeltas.Num(); ++h)
+		{
+			ScaleBuf(HeadDeltas[h]);
+			ScaleBuf(HeadBiasDeltas[h]);
+		}
+	}
+
+	// =====================================================================
+	// === (B) BACKBONE CONV UPDATES (ADAMW) ===============================
+	// =====================================================================
+
+	double* RESTRICT filt = Filters.GetData();
+	double* RESTRICT delta = Deltas.GetData();
+	double* RESTRICT dMean = DeltaMean.GetData();
+	double* RESTRICT dVar = DeltaVar.GetData();
+
+	double* RESTRICT bias = Bias.GetData();
+	double* RESTRICT bDelta = BiasDelta.GetData();
+	double* RESTRICT bMean = BiasMean.GetData();
+	double* RESTRICT bVar = BiasVar.GetData();
+
+	double* RESTRICT g = NormGamma.GetData();
+	double* RESTRICT gDel = NormGammaDelta.GetData();
+	double* RESTRICT gMean = NormGammaMean.GetData();
+	double* RESTRICT gVar = NormGammaVar.GetData();
+
+	double* RESTRICT be = NormBeta.GetData();
+	double* RESTRICT beDel = NormBetaDelta.GetData();
+	double* RESTRICT beMean = NormBetaMean.GetData();
+	double* RESTRICT beVar = NormBetaVar.GetData();
+
+	for (int L = 0; L < numLayers; ++L)
+	{
+		const double LR = LearningRate.IsValidIndex(L) ? LearningRate[L] : 1e-4;
+
+		const int fStart = FilterStart(L);
+		const int fEnd = (L + 1 < numLayers) ? FilterStart(L + 1) : Filters.Num();
+
+		for (int i = fStart; i < fEnd; ++i)
+		{
+			dMean[i] = AdamB1 * dMean[i] + (1.0 - AdamB1) * delta[i];
+			dVar[i] = AdamB2 * dVar[i] + (1.0 - AdamB2) * (delta[i] * delta[i]);
+
+			const double mHat = dMean[i] / (1.0 - pow(AdamB1, BatchIteration));
+			const double vHat = dVar[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+			filt[i] -= LR * (mHat / (sqrt(vHat) + eps));         // Adam update
+			filt[i] -= LR * AdamWDecay * filt[i];                // decoupled decay
+
+			delta[i] = 0.0;
+		}
+
+		const int bStart = BiasStart(L);
+		const int bEnd = (L + 1 < numLayers) ? BiasStart(L + 1) : Bias.Num();
+
+		for (int i = bStart; i < bEnd; ++i)
+		{
+			bMean[i] = AdamB1 * bMean[i] + (1.0 - AdamB1) * bDelta[i];
+			bVar[i] = AdamB2 * bVar[i] + (1.0 - AdamB2) * (bDelta[i] * bDelta[i]);
+
+			const double mHat = bMean[i] / (1.0 - pow(AdamB1, BatchIteration));
+			const double vHat = bVar[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+			bias[i] -= LR * (mHat / (sqrt(vHat) + eps)); // NO decay on bias
+
+			bDelta[i] = 0.0;
+		}
+	}
+
+	// =====================================================================
+	// === (C) LAYERNORM PARAMS (NO DECAY) ==================================
+	// =====================================================================
+	const double LN_LR = 1e-3;
+
+	for (int i = 0; i < NormGammaDelta.Num(); ++i)
+	{
+		gMean[i] = AdamB1 * gMean[i] + (1.0 - AdamB1) * gDel[i];
+		gVar[i] = AdamB2 * gVar[i] + (1.0 - AdamB2) * (gDel[i] * gDel[i]);
+
+		const double mHat = gMean[i] / (1.0 - pow(AdamB1, BatchIteration));
+		const double vHat = gVar[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+		g[i] -= LN_LR * (mHat / (sqrt(vHat) + eps));
+		gDel[i] = 0.0;
+
+		beMean[i] = AdamB1 * beMean[i] + (1.0 - AdamB1) * beDel[i];
+		beVar[i] = AdamB2 * beVar[i] + (1.0 - AdamB2) * (beDel[i] * beDel[i]);
+
+		const double mHat2 = beMean[i] / (1.0 - pow(AdamB1, BatchIteration));
+		const double vHat2 = beVar[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+		be[i] -= LN_LR * (mHat2 / (sqrt(vHat2) + eps));
+		beDel[i] = 0.0;
+	}
+
+	// =====================================================================
+	// === (D) YOLO HEADS ===============================================
+	// =====================================================================
+	for (int h = 0; h < HeadDeltas.Num(); ++h)
+	{
+		const double hLR = HeadLR;
+
+		double* RESTRICT hDel = HeadDeltas[h].GetData();
+		double* RESTRICT hM = HeadDeltasMean[h].GetData();
+		double* RESTRICT hV = HeadDeltasVar[h].GetData();
+		double* RESTRICT hW = HeadFilters[h].GetData();
+
+		for (int i = 0; i < HeadDeltas[h].Num(); ++i)
+		{
+			hM[i] = AdamB1 * hM[i] + (1.0 - AdamB1) * hDel[i];
+			hV[i] = AdamB2 * hV[i] + (1.0 - AdamB2) * (hDel[i] * hDel[i]);
+
+			const double mHat = hM[i] / (1.0 - pow(AdamB1, BatchIteration));
+			const double vHat = hV[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+			hW[i] -= hLR * (mHat / (sqrt(vHat) + eps));  // Adam
+			hW[i] -= hLR * AdamWDecay * hW[i];           // WD only here
+
+			hDel[i] = 0.0;
+		}
+
+		double* RESTRICT hb = HeadBiases[h].GetData();
+		double* RESTRICT hbD = HeadBiasDeltas[h].GetData();
+		double* RESTRICT hbM = HeadBiasMean[h].GetData();
+		double* RESTRICT hbV = HeadBiasVar[h].GetData();
+
+		for (int i = 0; i < HeadBiasDeltas[h].Num(); ++i)
+		{
+			hbM[i] = AdamB1 * hbM[i] + (1.0 - AdamB1) * hbD[i];
+			hbV[i] = AdamB2 * hbV[i] + (1.0 - AdamB2) * (hbD[i] * hbD[i]);
+
+			const double mHat = hbM[i] / (1.0 - pow(AdamB1, BatchIteration));
+			const double vHat = hbV[i] / (1.0 - pow(AdamB2, BatchIteration));
+
+			hb[i] -= hLR * (mHat / (sqrt(vHat) + eps)); // no decay
+
+			hbD[i] = 0.0;
+		}
+	}
+
+	LogSigmaMeanObj = AdamB1 * LogSigmaMeanObj + (1.0 - AdamB1) * LogSigmaObjDelta;
+	LogSigmaVarObj = AdamB2 * LogSigmaVarObj + (1.0 - AdamB2) * FMath::Pow(LogSigmaObjDelta, 2.0);
+
+	double mHat = LogSigmaMeanObj / (1.0 - pow(AdamB1, BatchIteration));
+	double vHat = LogSigmaVarObj / (1.0 - pow(AdamB2, BatchIteration));
+
+	LogSigmaObj -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaObjDelta = 0;
+
+	LogSigmaMeanCoord = AdamB1 * LogSigmaMeanCoord + (1.0 - AdamB1) * LogSigmaCoordDelta;
+	LogSigmaVarCoord = AdamB2 * LogSigmaVarCoord + (1.0 - AdamB2) * FMath::Pow(LogSigmaCoordDelta, 2.0);
+
+	mHat = LogSigmaMeanCoord / (1.0 - pow(AdamB1, BatchIteration));
+	vHat = LogSigmaVarCoord / (1.0 - pow(AdamB2, BatchIteration));
+
+	LogSigmaCoord -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaCoordDelta = 0;
+
+	LogSigmaMeanSize = AdamB1 * LogSigmaMeanSize + (1.0 - AdamB1) * LogSigmaSizeDelta;
+	LogSigmaVarSize = AdamB2 * LogSigmaVarSize + (1.0 - AdamB2) * FMath::Pow(LogSigmaSizeDelta, 2.0);
+
+	mHat = LogSigmaMeanSize / (1.0 - pow(AdamB1, BatchIteration));
+	vHat = LogSigmaVarSize / (1.0 - pow(AdamB2, BatchIteration));
+
+	LogSigmaSize -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaSizeDelta = 0;
+
+	const double progress = FMath::Clamp(Iteration / (double)CycleCount, 0.0, 1.0);
+
+	//for (int i = 0; i < LearningRate.Num(); i++)
+	//{
+	//	LearningRate[i] = LRMin + 0.5 * (LRMax - LRMin) * (1.0 + cos(PI * progress));
+	//}
+
+	//HeadLR = LRMinHead + 0.5 * (LRMaxHead - LRMinHead) * (1.0 + cos(PI * progress));
+
+	BatchIteration++;
+}
+
+
+
+
+void YOLO::ZeroGradients(bool zeroOptimizerState /*= false*/)
+{
+	// ---- 0) Backprop error buffers (activations) ----
+	if (Errors.Num() > 0)
+		FMemory::Memzero(Errors.GetData(), Errors.Num() * sizeof(double));
+	for (int h = 0; h < HeadErrors.Num(); ++h)
+		if (HeadErrors[h].Num() > 0)
+			FMemory::Memzero(HeadErrors[h].GetData(), HeadErrors[h].Num() * sizeof(double));
+
+	// ---- 1) Conv/stem gradient accumulators (inputs to ApplyGradientDeltas) ----
+	if (Deltas.Num() > 0)
+		FMemory::Memzero(Deltas.GetData(), Deltas.Num() * sizeof(double));
+	if (BiasDelta.Num() > 0)
+		FMemory::Memzero(BiasDelta.GetData(), BiasDelta.Num() * sizeof(double));
+
+	// ---- 2) LayerNorm gradient accumulators (inputs to ApplyGradientDeltas) ----
+	if (NormGammaDelta.Num() > 0)
+		FMemory::Memzero(NormGammaDelta.GetData(), NormGammaDelta.Num() * sizeof(double));
+	if (NormBetaDelta.Num() > 0)
+		FMemory::Memzero(NormBetaDelta.GetData(), NormBetaDelta.Num() * sizeof(double));
+
+	// ---- 3) YOLO heads gradient accumulators (inputs to ApplyGradientDeltas) ----
+	for (int h = 0; h < HeadDeltas.Num(); ++h)
+		if (HeadDeltas[h].Num() > 0)
+			FMemory::Memzero(HeadDeltas[h].GetData(), HeadDeltas[h].Num() * sizeof(double));
+	for (int h = 0; h < HeadBiasDeltas.Num(); ++h)
+		if (HeadBiasDeltas[h].Num() > 0)
+			FMemory::Memzero(HeadBiasDeltas[h].GetData(), HeadBiasDeltas[h].Num() * sizeof(double));
+
+	// ---- 4) (Optional) Optimizer state reset ----
+	if (zeroOptimizerState)
+	{
+		// Conv/stem Adam moments
+		if (DeltaMean.Num() > 0)
+			FMemory::Memzero(DeltaMean.GetData(), DeltaMean.Num() * sizeof(double));
+		if (DeltaVar.Num() > 0)
+			FMemory::Memzero(DeltaVar.GetData(), DeltaVar.Num() * sizeof(double));
+		if (BiasMean.Num() > 0)
+			FMemory::Memzero(BiasMean.GetData(), BiasMean.Num() * sizeof(double));
+		if (BiasVar.Num() > 0)
+			FMemory::Memzero(BiasVar.GetData(), BiasVar.Num() * sizeof(double));
+
+		// LayerNorm Adam moments
+		if (NormGammaMean.Num() > 0)
+			FMemory::Memzero(NormGammaMean.GetData(), NormGammaMean.Num() * sizeof(double));
+		if (NormGammaVar.Num() > 0)
+			FMemory::Memzero(NormGammaVar.GetData(), NormGammaVar.Num() * sizeof(double));
+		if (NormBetaMean.Num() > 0)
+			FMemory::Memzero(NormBetaMean.GetData(), NormBetaMean.Num() * sizeof(double));
+		if (NormBetaVar.Num() > 0)
+			FMemory::Memzero(NormBetaVar.GetData(), NormBetaVar.Num() * sizeof(double));
+
+		// YOLO head Adam moments
+		for (int h = 0; h < HeadDeltasMean.Num(); ++h)
+			if (HeadDeltasMean[h].Num() > 0)
+				FMemory::Memzero(HeadDeltasMean[h].GetData(), HeadDeltasMean[h].Num() * sizeof(double));
+		for (int h = 0; h < HeadDeltasVar.Num(); ++h)
+			if (HeadDeltasVar[h].Num() > 0)
+				FMemory::Memzero(HeadDeltasVar[h].GetData(), HeadDeltasVar[h].Num() * sizeof(double));
+		for (int h = 0; h < HeadBiasMean.Num(); ++h)
+			if (HeadBiasMean[h].Num() > 0)
+				FMemory::Memzero(HeadBiasMean[h].GetData(), HeadBiasMean[h].Num() * sizeof(double));
+		for (int h = 0; h < HeadBiasVar.Num(); ++h)
+			if (HeadBiasVar[h].Num() > 0)
+				FMemory::Memzero(HeadBiasVar[h].GetData(), HeadBiasVar[h].Num() * sizeof(double));
+
+		// Self-tuning loss weights (Adam moments)
+		LogSigmaMeanObj = 0.0; LogSigmaVarObj = 0.0;
+		LogSigmaMeanCoord = 0.0; LogSigmaVarCoord = 0.0;
+		LogSigmaMeanSize = 0.0; LogSigmaVarSize = 0.0;
+
+		// (Optional) also reset EMA if you truly want a full fresh start:
+		// for (int i = 0; i < ComponentLossEMA.Num(); ++i) ComponentLossEMA[i] = 0.0;
+	}
+}
+
+
+double YOLO::GetMean(TArray<double>& Input)
+{
+	int A = 0;
+	double Mean = 0;
+
+	while (A < Input.Num())
+	{
+		Mean += Input[A];
+
+		A++;
+	}
+
+	Mean /= Input.Num();
+
+	return Mean;
+}
+
+TArray<double> YOLO::GradientsWRTOutputs(TArray<double> Input1, int LayerID)
+{
+	int Start = FeatureStart(LayerID);
+	int NumMaps = MapCounts[LayerID];
+	int MapDim = MapDims[LayerID];
+	int LayerSize = NumMaps * MapDim * MapDim;
+
+	TArray<double> OutputGrad;
+	OutputGrad.SetNumZeroed(LayerSize);
+
+	int ProcessSize = FMath::Min(Input1.Num(), LayerSize);
+
+	// --- Element-wise multiply by activation derivatives ---
+	for (int i = 0; i < ProcessSize; i++)
+	{
+		int idx = Start + i;
+		double grad = Input1[i] * Derivatives[idx];
+		Errors[idx] += grad;  // accumulate instead of overwrite
+		OutputGrad[i] = grad;
+	}
+
+	// --- Accumulate bias deltas per feature map (1D layout) ---
+	//int BiasOffset = BiasStart(LayerID);
+
+	//for (int map = 0; map < NumMaps; map++)
+	//{
+	//	double biasGrad = 0.0;
+	//	int mapOffset = map * (MapDim * MapDim);
+
+	//	for (int i = 0; i < MapDim * MapDim; i++)
+	//	{
+	//		biasGrad += OutputGrad[mapOffset + i];
+	//	}
+
+	//	BiasDelta[BiasOffset + map] += biasGrad;
+	//}
+
+	return OutputGrad;
+}
+
+TArray<double> YOLO::GradientsWRTInputs(int LayerID)
+{
+	const int inCount = (LayerID > 0) ? MapCounts[LayerID - 1] : 1;
+	const int inDim = (LayerID > 0) ? MapDims[LayerID - 1] : ImageDimPx;
+	const int outDim = MapDims[LayerID];
+	const int kDim = FilterDims[LayerID];
+	const int stride = StrideSchedule[LayerID];
+	const int pad = PaddingSchedule[LayerID];
+
+	const int outBase = FeatureStart(LayerID);
+	const int filtBase = FilterStart(LayerID);
+
+	const int inPlane = inDim * inDim;
+	const int outPlane = outDim * outDim;
+	const int kSize = kDim * kDim;
+	const int filtersPerMap = inCount * kSize;
+
+	TArray<double> ret; ret.SetNumZeroed(inCount * inPlane);
+	double* RESTRICT retPtr = ret.GetData();
+
+	const double* RESTRICT errPtr = Errors.GetData() + outBase;
+	const double* RESTRICT filtPtr = Filters.GetData() + filtBase;
+
+	const int outMaps = MapCounts[LayerID];
+
+	// Parallelize over input channels (disjoint slices)
+	ParallelFor(inCount, [&](int32 imap)
+		{
+			double* RESTRICT r = retPtr + imap * inPlane;
+
+			for (int omap = 0; omap < outMaps; ++omap)
+			{
+				const int eBase = omap * outPlane;
+				const int fBase = omap * filtersPerMap + imap * kSize;
+
+				for (int oy = 0; oy < outDim; ++oy)
+				{
+					const int in_y0 = oy * stride - pad;
+
+					for (int ox = 0; ox < outDim; ++ox)
+					{
+						const int in_x0 = ox * stride - pad;
+						const double derr = errPtr[eBase + oy * outDim + ox];
+						if (derr == 0.0) continue;
+
+						for (int ky = 0; ky < kDim; ++ky)
+						{
+							const int iy = in_y0 + ky;
+							if ((unsigned)iy >= (unsigned)inDim) continue;
+
+							for (int kx = 0; kx < kDim; ++kx)
+							{
+								const int ix = in_x0 + kx;
+								if ((unsigned)ix >= (unsigned)inDim) continue;
+
+								const int fIdx = fBase + (kDim - 1 - ky) * kDim + (kDim - 1 - kx);
+								r[iy * inDim + ix] += derr * filtPtr[fIdx];
+							}
+						}
+					}
+				}
+			}
+		}, EParallelForFlags::None);
+
+	return ret;
+}
+
+TArray<double> YOLO::LayerNormBackward(TArray<double> Gradients, int LayerID, bool bComputeInputGrad /* = true */)
+{
+	const int numMaps = MapCounts[LayerID];
+	const int dim = MapDims[LayerID];
+	const int plane = dim * dim;
+	const int layerSize = numMaps * plane;
+	const int start = FeatureStart(LayerID);
+
+	const double* RESTRICT x = Features.GetData() + start;
+	const double* RESTRICT g = Gradients.GetData();
+
+	// We assume Norm* arrays are laid out per-channel across layers.
+	// Compute channel offset up to this layer.
+	int channelOffset = 0;
+	for (int l = 0; l < LayerID; ++l)
+		channelOffset += MapCounts[l];
+
+	// Pointers to per-channel stats/params for this layer
+	const double* RESTRICT meanPtr = NormMean.GetData() + channelOffset;
+	const double* RESTRICT varPtr = NormVar.GetData() + channelOffset;
+	const double* RESTRICT gammaPtr = NormGamma.GetData() + channelOffset;
+
+	double* RESTRICT dGammaPtr = NormGammaDelta.GetData() + channelOffset;
+	double* RESTRICT dBetaPtr = NormBetaDelta.GetData() + channelOffset;
+
+	const double eps = 1e-8;
+
+	TArray<double> gradInput;
+	if (bComputeInputGrad)
+	{
+		gradInput.SetNumZeroed(layerSize);
+	}
+
+	for (int c = 0; c < numMaps; ++c)
+	{
+		const double mean = meanPtr[c];
+		const double invStd = 1.0 / FMath::Sqrt(varPtr[c] + eps);
+		const double gamma = gammaPtr[c];
+
+		double sum_dy = 0.0;
+		double sum_dy_xhat = 0.0;
+
+		// Pass 1: accumulate param grads
+		for (int i = 0; i < plane; ++i)
+		{
+			const int idx = c * plane + i;
+			const double xhat = (x[idx] - mean) * invStd;
+			const double dy = g[idx];
+			sum_dy += dy;
+			sum_dy_xhat += dy * xhat;
+		}
+
+		// Parameter gradients (always computed)
+		dGammaPtr[c] += sum_dy_xhat;
+		dBetaPtr[c] += sum_dy;
+
+		// Optional: input gradient
+		if (bComputeInputGrad)
+		{
+			const double mean_dy = sum_dy / plane;
+			const double mean_dy_xhat = sum_dy_xhat / plane;
+
+			for (int i = 0; i < plane; ++i)
+			{
+				const int idx = c * plane + i;
+				const double xhat = (x[idx] - mean) * invStd;
+				const double dy = g[idx];
+
+				// dL/dx = gamma * invStd * (dy - mean(dy) - xhat * mean(dy * xhat))
+				gradInput[idx] = (gamma * invStd / plane) * (plane * dy - mean_dy - xhat * mean_dy_xhat);
+			}
+		}
+	}
+
+	return gradInput; // empty if bComputeInputGrad == false
+}
+
+TArray<double> YOLO::GetFeatureSlice(int StartIndex, int Length)
+{
+	TArray<double> RetVal;
+	if (StartIndex < 0 || Length <= 0 || StartIndex >= Features.Num())
+		return RetVal;
+
+	int ActualLength = FMath::Min(Length, Features.Num() - StartIndex);
+	RetVal.SetNumUninitialized(ActualLength);
+	FMemory::Memcpy(RetVal.GetData(), Features.GetData() + StartIndex, ActualLength * sizeof(double));
+	return RetVal;
+}
+
+TArray<double> YOLO::GetBiasSlice(int StartIndex, int Length)
+{
+	TArray<double> RetVal;
+	if (StartIndex < 0 || Length <= 0 || StartIndex >= Bias.Num())
+		return RetVal;
+
+	int ActualLength = FMath::Min(Length, Bias.Num() - StartIndex);
+	RetVal.SetNumUninitialized(ActualLength);
+	FMemory::Memcpy(RetVal.GetData(), Bias.GetData() + StartIndex, ActualLength * sizeof(double));
+	return RetVal;
+}
+
+TArray<double> YOLO::GetErrorSlice(int StartIndex, int Length)
+{
+	TArray<double> RetVal;
+	if (StartIndex < 0 || Length <= 0 || StartIndex >= Errors.Num())
+		return RetVal;
+
+	int ActualLength = FMath::Min(Length, Errors.Num() - StartIndex);
+	RetVal.SetNumUninitialized(ActualLength);
+	FMemory::Memcpy(RetVal.GetData(), Errors.GetData() + StartIndex, ActualLength * sizeof(double));
+	return RetVal;
+}
+
+
+TArray<double> YOLO::GetFilterSlice(int StartIndex, int Length)
+{
+	TArray<double> RetVal;
+	if (StartIndex < 0 || Length <= 0 || StartIndex >= Filters.Num())
+		return RetVal;
+
+	int ActualLength = FMath::Min(Length, Filters.Num() - StartIndex);
+	RetVal.SetNumUninitialized(ActualLength);
+	FMemory::Memcpy(RetVal.GetData(), Filters.GetData() + StartIndex, ActualLength * sizeof(double));
+	return RetVal;
+}
+
+
+TArray<double> YOLO::GetDeltaSlice(int StartIndex, int Length)
+{
+	TArray<double> RetVal;
+
+	// Input validation
+	if (StartIndex < 0 || StartIndex >= Deltas.Num() || Length <= 0)
+	{
+		return RetVal; // Return empty array if inputs are invalid
+	}
+
+	// Calculate how many elements we can actually take
+	int ActualLength = FMath::Min(Length, Deltas.Num() - StartIndex);
+
+	// Use TArray's Append with range
+	RetVal.Append(Deltas.GetData() + StartIndex, ActualLength);
+
+	return RetVal;
+}
+
+double YOLO::Sigmoid(double x)
+{
+	return 1.0 / (1.0 + FMath::Exp(-x));
+}
+
+void YOLO::ConvolveHead(const TArray<double>& Inputs, int layerID)
+{
+	// 1) Resolve head index
+	const int headIdx = AnchorHeadIDs.IndexOfByKey(layerID);
+	if (headIdx == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ConvolveHead: layerID %d not found in AnchorHeadIDs"), layerID);
+		return;
+	}
+
+	// 2) Geometry
+	const int inCh = MapCounts[layerID];
+	const int inDim = MapDims[layerID];
+	const int inPlane = inDim * inDim;
+
+	const int numAnch = Anchors[headIdx].Num();
+	const int kSize = HeadFilterDims[headIdx];
+	const int stride = HeadStrideSchedule[headIdx];
+	const int pad = HeadPaddingSchedule[headIdx];
+
+	constexpr int kOutPerAnchor = 5; // conf, tx, ty, tw, th
+	const int outDim = (int)FMath::FloorToInt((inDim + 2.0 * pad - kSize) / stride) + 1;
+	const int plane = outDim * outDim;
+	const int outSize = numAnch * plane * kOutPerAnchor;
+
+	// 3) Buffers
+	const double* RESTRICT inPtr = Inputs.GetData();
+	const double* RESTRICT filtPtr = HeadFilters[headIdx].GetData();
+	const double* RESTRICT biasPtr = HeadBiases[headIdx].GetData();
+	double* RESTRICT NetPtr = HeadNetFeatures[headIdx].GetData();
+	TArray<double>& outArr = HeadFeatures[headIdx]; // final (post-activation for conf/tx/ty), interleaved
+	outArr.SetNumZeroed(outSize);
+	double* RESTRICT outPtr = outArr.GetData();
+
+	if (!filtPtr || !biasPtr || !outPtr)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ConvolveHead: invalid buffer pointer(s) for head %d"), headIdx);
+		return;
+	}
+
+	// 4) Light per-channel normalization (matches backward)
+	const double eps = 1e-6;
+	const double clampVal = 3.0;   
+	const double mixAlpha = 0.85; 
+
+	TArray<double> normInputs;
+	normInputs.SetNumUninitialized(inCh * inPlane);
+
+	//HeadNormMean[headIdx].SetNum(inCh);
+	//HeadNormVar[headIdx].SetNum(inCh);
+
+	//for (int c = 0; c < inCh; ++c)
+	//{
+	//	const double* RESTRICT src = inPtr + c * inPlane;
+	//	double* RESTRICT dst = normInputs.GetData() + c * inPlane;
+
+
+	//	double mean = 0.0;
+	//	for (int i = 0; i < inPlane; ++i)
+	//		mean += src[i];
+	//	mean /= (double)inPlane;
+
+	//	double var = 0.0;
+	//	for (int i = 0; i < inPlane; ++i)
+	//	{
+	//		const double d = src[i] - mean;
+	//		var += d * d;
+	//	}
+	//	var /= (double)inPlane;
+
+	//	const double invStd = 1.0 / FMath::Sqrt(var + eps);
+
+	//	HeadNormMean[headIdx][c] = mean;
+	//	HeadNormVar[headIdx][c] = invStd;
+
+	//	for (int i = 0; i < inPlane; ++i)
+	//	{
+	//		// z-score normalize
+	//		double v = (src[i] - mean) * invStd;
+
+	//		// clamp to prevent outliers
+	//		v = FMath::Clamp(v, -clampVal, clampVal);
+
+	//		// soft-blend with original to keep contrast cues
+	//		v = mixAlpha * v + (1.0 - mixAlpha) * src[i];
+
+	//		
+	//		v = FMath::Clamp(v / clampVal, -1.0, 1.0);
+
+	//		dst[i] = v;
+	//	}
+	//}
+
+	const double* RESTRICT inNorm = Inputs.GetData();
+
+	// 5) Convolution rite into interleaved layout with correct activation
+	auto Sigmoid = [](double x) { return 1.0 / (1.0 + FMath::Exp(-x)); };
+
+	for (int a = 0; a < numAnch; ++a)
+	{
+		// Channels for this anchor start at ocBase
+		const int ocBase = a * kOutPerAnchor;
+
+		for (int gy = 0; gy < outDim; ++gy)
+		{
+			const int baseY = gy * stride - pad;
+			for (int gx = 0; gx < outDim; ++gx)
+			{
+				const int baseX = gx * stride - pad;
+				const int spatial = gy * outDim + gx;
+
+				// Compute each component channel for this anchor at (gx,gy)
+				for (int comp = 0; comp < kOutPerAnchor; ++comp)
+				{
+					const int oc = ocBase + comp;
+
+					// sum conv
+					double sum = 0.0;
+					for (int ic = 0; ic < inCh; ++ic)
+					{
+						const int inBase = ic * inPlane;
+						const int wBase = (oc * inCh + ic) * (kSize * kSize);
+
+						for (int ky = 0; ky < kSize; ++ky)
+						{
+							const int iy = baseY + ky;
+							if ((unsigned)iy >= (unsigned)inDim) continue;
+
+							for (int kx = 0; kx < kSize; ++kx)
+							{
+								const int ix = baseX + kx;
+								if ((unsigned)ix >= (unsigned)inDim) continue;
+
+								sum += inNorm[inBase + iy * inDim + ix] * filtPtr[wBase + ky * kSize + kx];
+							}
+						}
+					}
+					sum += biasPtr[oc];
+					const int outIndex = ((a * plane + spatial) * kOutPerAnchor) + comp;
+					// Activation policy: conf/tx/ty -> sigmoid ; tw/th -> linear (logits)
+					double activated = sum;
+
+					NetPtr[outIndex] = sum;
+
+					if (comp <= 2) activated = Sigmoid(sum);
+
+					// *** Interleaved write to match ParseYOLOOutput ***
+					// index = ((a * plane + spatial) * kOutPerAnchor) + comp
+					
+					outPtr[outIndex] = activated;
+				}
+			}
+		}
+	}
+}
+
+
+
+TArray<TArray<double>> YOLO::NormalizeSet2D(const TArray<TArray<double>>& Array2D)
+{
+	TArray<TArray<double>> NormalizedArray;
+	NormalizedArray.SetNum(Array2D.Num());
+
+	const double Epsilon = 1e-8;
+	const double MinStd = 0.05;   // floor variance to prevent blowups
+	const double MaxStd = 3.0;    // optional cap to prevent over-smoothing
+	const double MixAlpha = 0.3;   // blend factor between normalized and raw (stability)
+
+	for (int c = 0; c < Array2D.Num(); ++c)
+	{
+		const TArray<double>& Row = Array2D[c];
+		TArray<double>& NormRow = NormalizedArray[c];
+		NormRow.SetNum(Row.Num());
+
+		if (Row.Num() == 0)
+			continue;
+
+		// --- Compute mean ---
+		double mean = 0.0;
+		for (double v : Row)
+			mean += v;
+		mean /= Row.Num();
+
+		// --- Compute variance ---
+		double var = 0.0;
+		for (double v : Row)
+		{
+			double d = v - mean;
+			var += d * d;
+		}
+		var /= Row.Num();
+
+		double std = FMath::Sqrt(var + Epsilon);
+
+		// --- Clamp to stability range ---
+		std = FMath::Clamp(std, MinStd, MaxStd);
+
+		// --- Normalize with blending (to preserve contrast) ---
+		for (int j = 0; j < Row.Num(); ++j)
+		{
+			double normalized = (Row[j] - mean) / std;
+			
+			NormRow[j] = MixAlpha * normalized + (1.0 - MixAlpha) * Row[j];
+		}
+	}
+
+	return NormalizedArray;
+}
+
+TArray<double> YOLO::NormalizeSet(const TArray<double>& Input)
+{
+	const double Epsilon = 1e-8;
+	const double MinStd = 0.05;   // floor: prevents blowups in flat regions
+	const double MaxStd = 3.0;    // cap: prevents over-smoothing in bright detail
+	const double MixAlpha = 0.25;   //
+	const double ClampVal = 2.5;    // optional final clamp
+
+	// --- Detect channel layout ---
+	const int NumChannels = 1; // or use your stored channel count
+	const int SpatialSize = Input.Num() / FMath::Max(NumChannels, 1);
+
+	if (NumChannels <= 0 || SpatialSize <= 0)
+		return Input; // fallback safety
+
+	TArray<double> Normalized;
+	Normalized.SetNum(Input.Num());
+
+	for (int c = 0; c < NumChannels; ++c)
+	{
+		const int offset = c * SpatialSize;
+
+		// 1. Mean
+		double mean = 0.0;
+		for (int i = 0; i < SpatialSize; ++i)
+			mean += Input[offset + i];
+		mean /= SpatialSize;
+
+		// 2. Variance
+		double var = 0.0;
+		for (int i = 0; i < SpatialSize; ++i)
+		{
+			const double d = Input[offset + i] - mean;
+			var += d * d;
+		}
+		var /= SpatialSize;
+
+		// 3. Stable std with floor + cap
+		double std = FMath::Sqrt(var + Epsilon);
+		std = FMath::Clamp(std, MinStd, MaxStd);
+
+		// 4. Normalize with blend (retain contrast cues)
+		for (int i = 0; i < SpatialSize; ++i)
+		{
+			double centered = (Input[offset + i] - mean) / std;
+			centered = FMath::Clamp(centered, -ClampVal, ClampVal);
+
+			// blend raw + normalized
+			double mixed = MixAlpha * centered + (1.0 - MixAlpha) * Input[offset + i];
+			Normalized[offset + i] = mixed;
+		}
+	}
+
+	return Normalized;
+}
+
+
+
+void YOLO::ApplyNMS(TArray<FYOLODetection>& Detections, double IoUThreshold)
+{
+	if (Detections.Num() == 0)
+		return;
+
+	// --- 1. Sort by descending confidence ---
+	Detections.Sort([](const FYOLODetection& A, const FYOLODetection& B)
+		{
+			return A.Confidence > B.Confidence;
+		});
+
+	TArray<FYOLODetection> Final;
+	TArray<bool> Suppressed;
+	Suppressed.Init(false, Detections.Num());
+
+	// --- 2. Hard-NMS loop (keep only one per region) ---
+	for (int i = 0; i < Detections.Num(); ++i)
+	{
+		if (Suppressed[i])
+			continue;
+
+		const FYOLODetection& DetA = Detections[i];
+		Final.Add(DetA);
+
+		for (int j = i + 1; j < Detections.Num(); ++j)
+		{
+			if (Suppressed[j])
+				continue;
+
+			const FYOLODetection& DetB = Detections[j];
+			const double IoU = ComputeIoU(DetA.BBox, DetB.BBox);
+			double dynamicPosThresh = 0.4;
+			// If boxes overlap too much, keep only tighter one
+			if (IoU > dynamicPosThresh)
+			{
+				// Compute "tightness" = smaller area gets priority if conf similar
+				const double areaA = DetA.BBox.Z * DetA.BBox.W;
+				const double areaB = DetB.BBox.Z * DetB.BBox.W;
+				const bool A_is_tighter = (areaA < areaB * 0.9);
+
+				if (A_is_tighter || DetA.Confidence >= DetB.Confidence)
+					Suppressed[j] = true;
+				else
+					Suppressed[i] = true;
+			}
+		}
+	}
+
+	// --- 3. Remove any overly large boxes compared to average ---
+	if (Final.Num() > 1)
+	{
+		double avgArea = 0.0;
+		for (const auto& D : Final)
+			avgArea += D.BBox.Z * D.BBox.W;
+		avgArea /= Final.Num();
+
+		const double maxArea = avgArea * 1.5;  // was 2.0, loosened
+		const double minConf = 0.5;           // was 0.5, loosened
+
+		Final.RemoveAll([&](const FYOLODetection& D)
+			{
+				const double area = D.BBox.Z * D.BBox.W;
+				return (D.Confidence < minConf || area > maxArea);
+			});
+	}
+	else
+	{
+		// Single detection: allow lower threshold
+		if (Final[0].Confidence < 0.5)
+			Final.Empty();
+	}
+
+	// --- 4. Sort by confidence descending again ---
+	Final.Sort([](const FYOLODetection& A, const FYOLODetection& B)
+		{
+			return A.Confidence > B.Confidence;
+		});
+
+	Detections = MoveTemp(Final);
+}
+
+TArray<double> YOLO::Flatten2DArray(const TArray<TArray<double>>& Input)
+{
+	if (Input.Num() == 0 || Input[0].Num() == 0) return {};
+
+	int Rows = Input.Num();
+	int Cols = Input[0].Num();
+	TArray<double> RetVal;
+	RetVal.SetNumUninitialized(Rows * Cols);
+
+	for (int r = 0; r < Rows; r++)
+	{
+		FMemory::Memcpy(RetVal.GetData() + r * Cols, Input[r].GetData(), Cols * sizeof(double));
+	}
+
+	return RetVal;
+}
+
+double YOLO::ComputeIoU(FVector4 A, FVector4 B)
+{
+	double Ax1 = A.X - A.Z / 2.0f;
+	double Ay1 = A.Y - A.W / 2.0f;
+	double Ax2 = A.X + A.Z / 2.0f;
+	double Ay2 = A.Y + A.W / 2.0f;
+
+	double Bx1 = B.X - B.Z / 2.0f;
+	double By1 = B.Y - B.W / 2.0f;
+	double Bx2 = B.X + B.Z / 2.0f;
+	double By2 = B.Y + B.W / 2.0f;
+
+	double interX1 = FMath::Max(Ax1, Bx1);
+	double interY1 = FMath::Max(Ay1, By1);
+	double interX2 = FMath::Min(Ax2, Bx2);
+	double interY2 = FMath::Min(Ay2, By2);
+
+	double interW = FMath::Max(0.0f, interX2 - interX1);
+	double interH = FMath::Max(0.0f, interY2 - interY1);
+	double interArea = interW * interH;
+
+	double areaA = (Ax2 - Ax1) * (Ay2 - Ay1);
+	double areaB = (Bx2 - Bx1) * (By2 - By1);
+
+	return interArea / (areaA + areaB - interArea + 1e-6f);
+}
