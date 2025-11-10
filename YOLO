@@ -152,7 +152,9 @@ YOLO::YOLO(int ImageDims, TArray<int> ActivationIDSched, TArray<int> StrideSched
 	HeadNormMean.SetNum(AnchorHeadIDs.Num());
 	HeadNormVar.SetNum(AnchorHeadIDs.Num());
 	HeadFeatures.SetNum(AnchorHeadIDs.Num());
+	PrevHeadFeatures.SetNum(AnchorHeadIDs.Num());
 	HeadNetFeatures.SetNum(AnchorHeadIDs.Num());
+	PrevHeadNetFeatures.SetNum(AnchorHeadIDs.Num());
 	HeadErrors.SetNum(AnchorHeadIDs.Num());
 	HeadDeltas.SetNum(AnchorHeadIDs.Num());
 	HeadDeltasMean.SetNum(AnchorHeadIDs.Num());
@@ -221,7 +223,7 @@ YOLO::YOLO(int ImageDims, TArray<int> ActivationIDSched, TArray<int> StrideSched
 
 			double limit = FMath::Sqrt(6.0 / (inCh * kDim * kDim + outCh)) ;
 			for (int i = 0; i < numWeights; ++i)
-				HeadFilters[h][i] = FMath::RandRange(-limit*0.65, limit*0.65);
+				HeadFilters[h][i] = FMath::RandRange(-limit*0.75, limit*0.75);
 
 				
 
@@ -236,16 +238,16 @@ YOLO::YOLO(int ImageDims, TArray<int> ActivationIDSched, TArray<int> StrideSched
 			HeadNormVar[h].SetNumZeroed(outCh);
 
 			auto logit = [](double p) { return FMath::Loge(p / (1.0 - p)); };
-			const double p_prior = 0.2;                     // tune 0.003–0.02
+			const double p_prior = 0.01;                     // tune 0.003–0.02
 			const double conf_bias_prior = logit(p_prior);   //-4.595
 
 			for (int a = 0; a < numAnch; ++a)
 			{
-				HeadBiases[h][a * 5 + 0] = -1.0;  // conf
+				HeadBiases[h][a * 5 + 0] =conf_bias_prior;  // conf
 				HeadBiases[h][a * 5 + 1] = 0;              // tx
 				HeadBiases[h][a * 5 + 2] = 0;              // ty
-				HeadBiases[h][a * 5 + 3] =-1.00;              // tw
-				HeadBiases[h][a * 5 + 4] = -1.0;              // th
+				HeadBiases[h][a * 5 + 3] =0;              // tw
+				HeadBiases[h][a * 5 + 4] = 0;              // th
 			}
 
 			// Feature & error buffers
@@ -256,20 +258,25 @@ YOLO::YOLO(int ImageDims, TArray<int> ActivationIDSched, TArray<int> StrideSched
 			const int outDim = (int)FMath::Floor((inDim + 2 * pad - kSize) / stride) + 1;
 			const int plane = outDim * outDim;
 			HeadFeatures[h].SetNumZeroed(outCh * plane);
+			PrevHeadFeatures[h].SetNumZeroed(outCh * plane);
 			HeadNetFeatures[h].SetNumZeroed(outCh * plane);
+			PrevHeadNetFeatures[h].SetNumZeroed(outCh * plane);
 			HeadErrors[h].SetNumZeroed(outCh * plane);
 		}
 	}
 
-	LogSigmaObj = -2.10;
-	LogSigmaCoord =-0.80;
-	LogSigmaSize =-0.8;
+	LogSigmaObj = -0.05;
+	LogSigmaNegObj = 0.5;
+	LogSigmaCoord =0.1;
+	LogSigmaSize =0.5;
 
 	LogSigmaMeanObj = 0.0;
+	LogSigmaMeanNegObj = 0.0;
 	LogSigmaMeanCoord = 0.0;
 	LogSigmaMeanSize = 0.0;
 
 	LogSigmaVarObj = 0.0;
+	LogSigmaVarNegObj = 0.0;
 	LogSigmaVarCoord = 0.0;
 	LogSigmaVarSize = 0.0;
 
@@ -318,19 +325,13 @@ void YOLO::Forward(TArray<double> Inputs)
 TArray<double> YOLO::CreateYOLOTargetFromLabel(const TArray<double> originalLabel, int sampleIndex)
 {
 	constexpr int kOutPerAnchor = 5;   // [conf, tx, ty, tw, th]
-	const double posThresh = 0.7;
-	const double negThresh = 0.4;
-	const double ignoreValue = -1.0;
+	const double posThresh = 0.50;     // anchor IoU >= 0.5 => positive
+	const double negThresh = 0.30;     // anchor IoU <= 0.3 => negative
+	const double ignoreValue = -1.0;   // ignored cells
 	const double eps = 1e-9;
 
 	if (originalLabel.Num() < 4)
 		return {};
-
-	// --- Clamp label box to [0,1] normalized range ---
-	const double gx = FMath::Clamp(originalLabel[0], 0.0, 1.0);
-	const double gy = FMath::Clamp(originalLabel[1], 0.0, 1.0);
-	const double gw = FMath::Clamp(originalLabel[2], 1e-6, 1.0);
-	const double gh = FMath::Clamp(originalLabel[3], 1e-6, 1.0);
 
 	// ---- Compute total output size for all heads ----
 	int totalOutputs = 0;
@@ -346,56 +347,70 @@ TArray<double> YOLO::CreateYOLOTargetFromLabel(const TArray<double> originalLabe
 
 	int globalOffset = 0;
 
-	// === Iterate over detection heads ===
+	// === Iterate over all detection heads ===
 	for (int head = 0; head < Anchors.Num(); ++head)
 	{
 		const int grid = HeadFeatureDims[head];
 		const int numAnch = Anchors[head].Num();
 		const int headOutputs = grid * grid * numAnch * kOutPerAnchor;
 
-		// --- Grid cell position ---
-		const int cellX = FMath::Clamp(FMath::FloorToInt(gx * grid), 0, grid - 1);
-		const int cellY = FMath::Clamp(FMath::FloorToInt(gy * grid), 0, grid - 1);
-
-		TArray<double> IoUs;
-		const int bestAnchor = ComputeAnchorMatch(gw, gh, head, IoUs);
-
-		for (int a = 0; a < numAnch; ++a)
+		for (int b = 0; b + 3 < originalLabel.Num(); b += 4)
 		{
-			const double iou = FMath::Clamp(IoUs[a], 0.0, 1.0);
-			const int idx = globalOffset + ((cellY * grid + cellX) * numAnch + a) * kOutPerAnchor;
+			const double gx = FMath::Clamp(originalLabel[b + 0], 0.0, 1.0);
+			const double gy = FMath::Clamp(originalLabel[b + 1], 0.0, 1.0);
+			const double gw = FMath::Clamp(originalLabel[b + 2], eps, 1.0);
+			const double gh = FMath::Clamp(originalLabel[b + 3], eps, 1.0);
 
-			double confTarget = 0.0;
+			// grid cell location
+			const int cellX = FMath::Clamp(FMath::FloorToInt(gx * grid), 0, grid - 1);
+			const int cellY = FMath::Clamp(FMath::FloorToInt(gy * grid), 0, grid - 1);
 
-			// --- Confidence target logic (no inflation, matches backward BCE) ---
-			if (iou > posThresh)
+			// compute IoU with all anchors for this head
+			TArray<double> IoUs;
+			const int bestAnchor = ComputeAnchorMatch(gw, gh, head, IoUs);
+
+			for (int a = 0; a < numAnch; ++a)
 			{
-				confTarget = iou;  // proportional to IoU, up to 1.0
-			}
-			else if (iou < negThresh)
-			{
-				confTarget = 0.0;  // negative
-			}
-			else
-			{
-				confTarget = ignoreValue;  // ignore zone
-			}
+				const double anchorW = Anchors[head][a][0];
+				const double anchorH = Anchors[head][a][1];
+				const int baseIdx = globalOffset + ((cellY * grid + cellX) * numAnch + a) * kOutPerAnchor;
 
-			Targets[idx + 0] = confTarget;
+				double confTarget = 0.0;
 
-			// --- Encode positive sample for best anchor ---
-			if (a == bestAnchor && confTarget > 0.0)
-			{
-				const double aw = Anchors[head][a][0];
-				const double ah = Anchors[head][a][1];
+				if (a == bestAnchor)
+				{
+					const double iou = IoUs[a];
+					if (iou >= posThresh)
+					{
+						confTarget = 1.0;   // soft label by IoU
+						const double tx = gx * grid - cellX;
+						const double ty = gy * grid - cellY;
+						const double tw = log((gw / (anchorW + eps)));
+						const double th = log((gh / (anchorH + eps)));
 
-				// === Encode exactly as decode expects ===
-				// (tx,ty) are fractional cell offsets in [0,1], learned via sigmoid
-				// (tw,th) are log(anchor ratio), learned via exp
-				Targets[idx + 1] = gx * grid - cellX;             // tx target
-				Targets[idx + 2] = gy * grid - cellY;             // ty target
-				Targets[idx + 3] = log((gw / (aw + eps)));        // tw target
-				Targets[idx + 4] = log((gh / (ah + eps)));        // th target
+						Targets[baseIdx + 0] = confTarget;
+						Targets[baseIdx + 1] = tx;
+						Targets[baseIdx + 2] = ty;
+						Targets[baseIdx + 3] = tw;
+						Targets[baseIdx + 4] = th;
+					}
+					else if (iou <= negThresh)
+					{
+						Targets[baseIdx + 0] = 0.0;    // negative
+					}
+					else
+					{
+						Targets[baseIdx + 0] = ignoreValue; // ignore band
+					}
+				}
+				else
+				{
+					const double iou = IoUs[a];
+					if (iou <= negThresh)
+						Targets[baseIdx + 0] = 0.0;
+					else
+						Targets[baseIdx + 0] = ignoreValue;
+				}
 			}
 		}
 
@@ -404,6 +419,7 @@ TArray<double> YOLO::CreateYOLOTargetFromLabel(const TArray<double> originalLabe
 
 	return Targets;
 }
+
 
 
 
@@ -504,7 +520,7 @@ TArray<FYOLODetection> YOLO::ParseYOLOOutput(const TArray<double>& networkOutput
 
 					// Apply activations ONCE (not double-sigmoid)
 					const double conf = Sigmoid(confLogit);
-					if (conf < 0.55)
+					if (conf < 0.5)
 						continue;
 
 					const double tx = Sigmoid(txLogit);
@@ -537,7 +553,7 @@ TArray<FYOLODetection> YOLO::ParseYOLOOutput(const TArray<double>& networkOutput
 		}
 	}
 
-	ApplyNMS(Detections, 0.3);
+	ApplyNMS(Detections, 0.35);
 	return Detections;
 }
 
@@ -556,6 +572,8 @@ FCIoUGradResult YOLO::ComputeCIoUGrad(FVector4 pred, FVector4 target)
 	double interArea = interW * interH;
 	double unionArea = pred.Z * pred.W + target.Z * target.W - interArea + eps;
 	double IoU = interArea / unionArea;
+
+	//GEngine->AddOnScreenDebugMessage(1476, 2.5f, FColor::Magenta, FString(TEXT("IOU: ") + FString::SanitizeFloat(IoU)));
 
 	// Enclosing box
 	double c_x1 = FMath::Min(Ax1, Bx1);
@@ -617,6 +635,59 @@ double YOLO::Softplus(double x)
 	return log1p(exp(x));
 }
 
+FDIoUGradResult YOLO::ComputeDIoUGrad(const FVector4& pred, const FVector4& target)
+{
+	const double eps = 1e-9;
+
+	const double px = pred.X;
+	const double py = pred.Y;
+	const double pw = pred.Z;
+	const double ph = pred.W;
+
+	const double gx = target.X;
+	const double gy = target.Y;
+	const double gw = target.Z;
+	const double gh = target.W;
+
+	// --- IoU ---
+	const double inter_w = FMath::Max(0.0, FMath::Min(px + pw / 2.0, gx + gw / 2.0) - FMath::Max(px - pw / 2.0, gx - gw / 2.0));
+	const double inter_h = FMath::Max(0.0, FMath::Min(py + ph / 2.0, gy + gh / 2.0) - FMath::Max(py - ph / 2.0, gy - gh / 2.0));
+	const double inter = inter_w * inter_h;
+	const double unionA = pw * ph + gw * gh - inter + eps;
+	const double iou = inter / unionA;
+
+	// --- center distance / enclosing box ---
+	const double cx1 = FMath::Min(px - pw / 2.0, gx - gw / 2.0);
+	const double cy1 = FMath::Min(py - ph / 2.0, gy - gh / 2.0);
+	const double cx2 = FMath::Max(px + pw / 2.0, gx + gw / 2.0);
+	const double cy2 = FMath::Max(py + ph / 2.0, gy + gh / 2.0);
+	const double cw = cx2 - cx1;
+	const double ch = cy2 - cy1;
+
+	const double rho2 = (px - gx) * (px - gx) + (py - gy) * (py - gy);
+	const double c2 = cw * cw + ch * ch + eps;
+
+	const double diou = iou - (rho2 / c2);
+
+	// === Gradients (approximate, stable version) ===
+	const double diouLoss = 1.0 - diou;
+	const double dIoUdx = 2.0 * (px - gx) / c2;  // distance term grad
+	const double dIoUdy = 2.0 * (py - gy) / c2;
+
+	FDIoUGradResult out;
+	out.diou = diou;
+	out.dx = dIoUdx;  
+	out.dy = dIoUdy; 
+
+	// approximate IoU width/height gradients (still keep scale awareness)
+	out.dw = (gw - pw) / (gw + eps);
+	out.dh = (gh - ph) / (gh + eps);
+
+	out.dw = FMath::Clamp(out.dw, -0.5, 0.5);
+	out.dh = FMath::Clamp(out.dh, -0.5, 0.5);
+
+	return out;
+}
 
 void YOLO::Convolve(int LayerID)
 {
@@ -701,54 +772,72 @@ void YOLO::LayerNorm(int LayerID)
 	const double* RESTRICT g = NormGamma.GetData() + biasBase;
 	const double* RESTRICT b = NormBeta.GetData() + biasBase;
 
-	for (int c = 0; c < maps; ++c)
-	{
-		const double* RESTRICT x = net + c * mapArea;
-		double* RESTRICT y = out + c * mapArea;
-		const double gamma = g[c], beta = b[c];
-
-		double mean = 0.0;
-		for (int i = 0; i < mapArea; ++i) mean += x[i];
-		mean /= mapArea;
-
-		double var = 0.0;
-		for (int i = 0; i < mapArea; ++i) { const double d = x[i] - mean; var += d * d; }
-		var /= mapArea;
-
-		NormMean[biasBase + c] = mean;
-		NormVar[biasBase + c] = var;
-
-		const double invStd = 1.0 / FMath::Sqrt(var + eps);
-
-		for (int i = 0; i < mapArea; ++i)
+	// Parallelize across feature maps (channels)
+	ParallelFor(maps, [&](int32 c)
 		{
-			const double xhat = (x[i] - mean) * invStd;
-			y[i] = xhat * gamma + beta;
-		}
-	}
+			const double* RESTRICT x = net + c * mapArea;
+			double* RESTRICT y = out + c * mapArea;
+			const double gamma = g[c];
+			const double beta = b[c];
+
+			double mean = 0.0;
+			for (int i = 0; i < mapArea; ++i)
+				mean += x[i];
+			mean /= mapArea;
+
+			double var = 0.0;
+			for (int i = 0; i < mapArea; ++i)
+			{
+				const double d = x[i] - mean;
+				var += d * d;
+			}
+			var /= mapArea;
+
+			const double invStd = 1.0 / FMath::Sqrt(var + eps);
+
+			for (int i = 0; i < mapArea; ++i)
+			{
+				const double xhat = (x[i] - mean) * invStd;
+				y[i] = xhat * gamma + beta;
+			}
+
+			// Each thread writes its own channel's stats
+			NormMean[biasBase + c] = mean;
+			NormVar[biasBase + c] = var;
+		});
 }
 
 int YOLO::ComputeAnchorMatch(double gw, double gh, int headIdx, TArray<double>& IoUs)
 {
-	IoUs.SetNum(Anchors[headIdx].Num());
+	IoUs.Init(0.0, Anchors[headIdx].Num());
+	int bestIdx = 0;
 	double bestIoU = 0.0;
-	int bestIdx = -1;
 
-	for (int i = 0; i < Anchors[headIdx].Num(); ++i)
+	for (int a = 0; a < Anchors[headIdx].Num(); ++a)
 	{
-		const double aw = Anchors[headIdx][i][0];
-		const double ah = Anchors[headIdx][i][1];
-		const double interW = FMath::Min(gw, aw);
-		const double interH = FMath::Min(gh, ah);
-		const double interArea = interW * interH;
-		const double unionArea = gw * gh + aw * ah - interArea;
-		const double iou = interArea / (unionArea + 1e-9);
-		IoUs[i] = iou;
+		const double aw = Anchors[headIdx][a][0];
+		const double ah = Anchors[headIdx][a][1];
+
+		// assume anchors & targets are normalized to [0,1]
+		const double inter = FMath::Min(aw, gw) * FMath::Min(ah, gh);
+		const double unionA = aw * ah + gw * gh - inter + 1e-9;
+		const double iou = inter / unionA;
+
+		if (gw != 0)
+		{
+			GEngine->AddOnScreenDebugMessage(633, 2.5f, FColor::Magenta, FString(TEXT("GW: ") + FString::SanitizeFloat(gw)));
+			GEngine->AddOnScreenDebugMessage(634, 2.5f, FColor::Magenta, FString(TEXT("GH: ") + FString::SanitizeFloat(gh)));
+			GEngine->AddOnScreenDebugMessage(635, 2.5f, FColor::Magenta, FString(TEXT("AW: ") + FString::SanitizeFloat(aw)));
+			GEngine->AddOnScreenDebugMessage(636, 2.5f, FColor::Magenta, FString(TEXT("AH: ") + FString::SanitizeFloat(ah)));
+		}
+		
+
+		IoUs[a] = iou;
 
 		if (iou > bestIoU)
 		{
 			bestIoU = iou;
-			bestIdx = i;
+			bestIdx = a;
 		}
 	}
 	return bestIdx;
@@ -756,13 +845,43 @@ int YOLO::ComputeAnchorMatch(double gw, double gh, int headIdx, TArray<double>& 
 
 void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
 {
-	constexpr int kOutPerAnchor = 5; // [conf, tx, ty, tw, th]
+	auto huber = [](double d) { const double beta = 0.1; return (fabs(d) < beta) ? 0.5 * d * d / beta : fabs(d) - 0.5 * beta; };
+	auto huberGrad = [](double d) { const double beta = 0.1; return (fabs(d) < beta) ? d / beta : FMath::Sign(d); };
 
-	const double wObj = 5.0;
-	const double wCoord = 3.0;
-	const double wSize = 2.0;
+	constexpr int kOutPerAnchor = 5;
 
-	const double clipLogit = 5.0; // clamp tw/th logits before exp
+	// === Base uncertainty weights ===
+	const double wObj_base = 1.0;
+	const double wCoord_base = 1.0;
+	const double wSize_base = 0.01;
+
+	// --- Persistent EMA for pos/neg ratio ---
+	static double avgPosNegRatio = 1.0;
+	const double ema = 0.95;
+
+	int tPos = 0, tNeg = 0;
+	for (int i = 0; i + 4 < Targets.Num(); i += kOutPerAnchor) {
+		const double t_conf = Targets[i + 0];
+		if (t_conf > 0.0) ++tPos;
+		else if (t_conf == 0.0) ++tNeg;
+	}
+	const double curRatio = (tNeg > 0) ? (double)tPos / (double)tNeg : 1.0;
+	avgPosNegRatio = ema * avgPosNegRatio + (1.0 - ema) * curRatio;
+
+	double wCoord = exp(-2.0 * LogSigmaCoord);
+	double wSize = exp(-2.0 * LogSigmaSize);
+
+	double ObjLossSum = 0.0;
+	double ObjLossSumNeg = 0.0;
+	double CoordLossSum = 0.0;
+	double SizeLossSum = 0.0;
+
+	// Numerics
+	const double eps = 1e-9;
+	const double clipLogit = 5.0;
+	const double maxGrad = 0.3;
+	const double alphaFocal = 0.25;
+	const double gammaFocal = 3.0;
 
 	int globalTgtOffset = 0;
 
@@ -786,9 +905,10 @@ void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
 		const int stride = HeadStrideSchedule[head];
 		const int pad = HeadPaddingSchedule[head];
 
-		// Buffers
-		const double* RESTRICT headOut = HeadFeatures[head].GetData();       // ((a*plane + p)*5 + comp); conf/tx/ty post-sigmoid, tw/th linear
-		const double* RESTRICT headNet = HeadNetFeatures[head].GetData();     // raw logits for all 5 comps (net before activation)
+		double HeadGradWeight = 1.0;
+
+		const double* RESTRICT headOut = HeadFeatures[head].GetData();
+		const double* RESTRICT headNet = HeadNetFeatures[head].GetData();
 		double* RESTRICT headErr = HeadErrors[head].GetData();
 		double* RESTRICT headDW = HeadDeltas[head].GetData();
 		double* RESTRICT headDB = HeadBiasDeltas[head].GetData();
@@ -799,42 +919,47 @@ void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
 			continue;
 		}
 
-		// ===== A) Local gradients at head outputs (per-pixel/channel) =====
-		for (int a = 0; a < numAnch; ++a)
-		{
-			for (int comp = 0; comp < kOutPerAnchor; ++comp)
+		TArray<double> objPosPart; objPosPart.Init(0.0, outCh);
+		TArray<double> objNegPart; objNegPart.Init(0.0, outCh);
+		TArray<double> coordPart;  coordPart.Init(0.0, outCh);
+		TArray<double> sizePart;   sizePart.Init(0.0, outCh);
+
+		int headPosCount = 0;
+		FCriticalSection posLock;
+
+		ParallelFor(outCh, [&](int32 oc)
 			{
-				const int oc = a * kOutPerAnchor + comp;
+				const int a = oc / kOutPerAnchor;
+				const int comp = oc % kOutPerAnchor;
+
+				double localObjPos = 0.0;
+				double localObjNeg = 0.0;
+				double localCoord = 0.0;
+				double localSize = 0.0;
 				double biasSum = 0.0;
+				int localPos = 0;
 
 				for (int p = 0; p < plane; ++p)
 				{
-					const int interIdx = ((a * plane + p) * kOutPerAnchor) + comp;
 					const int chIdx = oc * plane + p;
-
-					
 					const int tgt_base = globalTgtOffset + p * (numAnch * kOutPerAnchor) + a * kOutPerAnchor;
-
-
 					if (!Targets.IsValidIndex(tgt_base + 4)) { headErr[chIdx] = 0.0; continue; }
 
 					const double t_conf = Targets[tgt_base + 0];
-
 					if (t_conf < -0.5) { headErr[chIdx] = 0.0; continue; }
 
 					const bool isPos = (t_conf > 0.0);
-
-
 					const double t_tx = Targets[tgt_base + 1];
 					const double t_ty = Targets[tgt_base + 2];
 					const double t_tw = Targets[tgt_base + 3];
 					const double t_th = Targets[tgt_base + 4];
 
 					const int base = (a * plane + p) * kOutPerAnchor;
+					const double confLogit = headNet[base + 0];
 					const double tx = headOut[base + 1];
 					const double ty = headOut[base + 2];
 					const double tw = FMath::Clamp(headNet[base + 3], -clipLogit, clipLogit);
-					const double th = FMath::Clamp(headNet[base + 4], -clipLogit, clipLogit); 
+					const double th = FMath::Clamp(headNet[base + 4], -clipLogit, clipLogit);
 
 					const int G = grid;
 					const int cellX = (p % G);
@@ -842,129 +967,180 @@ void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
 					const double aw = Anchors[head][a][0];
 					const double ah = Anchors[head][a][1];
 
-					const double bx = (cellX + tx) / (double)G;
-					const double by = (cellY + ty) / (double)G;
-					const double bw = aw * FMath::Exp(tw);
-					const double bh = ah * FMath::Exp(th);
-
-					const double gx = (cellX + t_tx) / (double)G;
-					const double gy = (cellY + t_ty) / (double)G;
-					const double gw = aw * FMath::Exp(t_tw);
-					const double gh = ah * FMath::Exp(t_th);
-
-					const double iou = FMath::Clamp(ComputeIoU(FVector4(bx, by, bw, bh),
-						FVector4(gx, gy, gw, gh)), 0.0, 1.0);
+					double gx = (cellX + t_tx) / (double)G;
+					double gy = (cellY + t_ty) / (double)G;
+					double gw = aw * FMath::Exp(t_tw);
+					double gh = ah * FMath::Exp(t_th);
 
 					double grad = 0.0;
 
 					if (comp == 0)
 					{
-						
-						const double logit = headNet[interIdx]; 
-						const double y = 1.0 / (1.0 + FMath::Exp(-logit));
-						const double t = isPos ? 1.0 : 0.0;
+						const double rawLogit = FMath::Clamp(confLogit, -clipLogit, clipLogit);
+						const double pred = 1.0 / (1.0 + exp(-rawLogit));
+						const double target = isPos ? 1.0 : 0.0;
 
-						
-						const double gamma = 2.0;
-						const double focal = FMath::Pow(1.0 - FMath::Abs(y - t), gamma);
+						const double wPosObj = exp(-2.0 * LogSigmaObj);
+						const double wNegObj = exp(-2.0 * LogSigmaNegObj);
+						const double wObj = isPos ? wPosObj : wNegObj;
 
-					
-						if (isPos) {
-							const double iouBoost = 1.0 + 0.5 * iou;      
-							grad = (y - t) * wObj * focal * 1.5 * iouBoost;
-						}
-						else {
-							grad = (y - t) * wObj * focal * 0.15;         
-						}
+						const double alpha_pos = 0.5;
+						const double alpha_neg = 1.0 - alpha_pos;
+						const double alpha = isPos ? alpha_pos : alpha_neg;
+						const double p_t = isPos ? pred : (1.0 - pred);
+						const double focal = FMath::Pow(1.0 - p_t, gammaFocal);
+
+						grad = wObj * focal * alpha * (pred - target);
+						grad += 0.001 * rawLogit; // L2 regularization
+						grad = FMath::Clamp(grad, -maxGrad, maxGrad);
+
+						const double loss_raw = -(target * log(pred + eps) + (1.0 - target) * log(1.0 - pred + eps));
+						const double loss_eff = wObj * alpha * focal * loss_raw;
+
+						headErr[chIdx] = grad * HeadGradWeight;
+						if (isPos) localObjPos += loss_eff; else localObjNeg += loss_eff;
+						if (isPos) ++localPos;
 					}
-					else if (comp >= 1 && comp <= 4)
+					else if (comp == 1 || comp == 2 || comp == 3 || comp == 4)
 					{
 						if (!isPos) { headErr[chIdx] = 0.0; continue; }
 
-				
-						const double dbx = (gx - bx);
-						const double dby = (gy - by);
-						const double dbw = (gw - bw);
-						const double dbh = (gh - bh);
+						const double t_tw_c = FMath::Clamp(t_tw, -clipLogit, clipLogit);
+						const double t_th_c = FMath::Clamp(t_th, -clipLogit, clipLogit);
+						const double tw_c = FMath::Clamp(tw, -clipLogit, clipLogit);
+						const double th_c = FMath::Clamp(th, -clipLogit, clipLogit);
 
-					
-						const double d_bx_d_tx = 1.0 / (double)G; // tx,ty are already post-sigmoid offsets
-						const double d_by_d_ty = 1.0 / (double)G;
-						const double d_bw_d_tw = bw;              // d(aw*exp(tw)) = bw
-						const double d_bh_d_th = bh;              // 
-						const double logit = headNet[interIdx];
+						const double bx = (cellX + tx) / (double)G;
+						const double by = (cellY + ty) / (double)G;
+						const double bw = aw * FMath::Exp(tw_c);
+						const double bh = ah * FMath::Exp(th_c);
 
-						switch (comp)
-						{
-							case 1:
-							{
-								// tx gradient: include sigmoid'(logit) because training uses logits for tx
-								const double logit_tx = headNet[base + 1];
-								const double sig = 1.0 / (1.0 + FMath::Exp(-logit_tx));
-								const double sigp = sig * (1.0 - sig);
-								grad = wCoord * dbx * d_bx_d_tx * sigp;
-								break;
-							}
-							case 2:
-							{
-								// ty gradient: include sigmoid'(logit)
-								const double logit_ty = headNet[base + 2];
-								const double sig = 1.0 / (1.0 + FMath::Exp(-logit_ty));
-								const double sigp = sig * (1.0 - sig);
-								grad = wCoord * dby * d_by_d_ty * sigp;
-								break;
-							}
-							case 3:
-								grad = wSize * dbw * d_bw_d_tw; // tw uses exp(logit), already correct
-								break;
-							case 4:
-								grad = wSize * dbh * d_bh_d_th; // th same
-								break;
-						}
+						gw = aw * FMath::Exp(t_tw_c);
+						gh = ah * FMath::Exp(t_th_c);
+						gw = FMath::Clamp(gw, 1e-6, 1.0);
+						gh = FMath::Clamp(gh, 1e-6, 1.0);
+						const double bw_c = FMath::Clamp(bw, 1e-6, 1.0);
+						const double bh_c = FMath::Clamp(bh, 1e-6, 1.0);
 
-						// Mild IoU-aware upweighting
-						grad *= (1.0 + 0.5 * iou); // <= 1.5x
+						const FVector4 predBox(bx, by, bw_c, bh_c);
+						const FVector4 tgtBox(gx, gy, gw, gh);
+						FDIoUGradResult gdiou = ComputeDIoUGrad(predBox, tgtBox);
+
+						if (!FMath::IsFinite(gdiou.diou)) gdiou = { 0,0,0,0,0 };
+
+						const double diouLoss = 1.0 - gdiou.diou;
+						double gxGrad = gdiou.dx * (double)grid * wCoord;
+						double gyGrad = gdiou.dy * (double)grid * wCoord;
+
+						const double sw = FMath::Sqrt(bw_c);
+						const double sh = FMath::Sqrt(bh_c);
+						const double stw = FMath::Sqrt(gw);
+						const double sth = FMath::Sqrt(gh);
+
+						double grad_sqrt_w = (FMath::IsNearlyZero(sw) ? 0.0 : (stw - sw) * (0.5 / sw) * bw_c);
+						double grad_sqrt_h = (FMath::IsNearlyZero(sh) ? 0.0 : (sth - sh) * (0.5 / sh) * bh_c);
+						grad_sqrt_w = FMath::Clamp(grad_sqrt_w, -maxGrad, maxGrad);
+						grad_sqrt_h = FMath::Clamp(grad_sqrt_h, -maxGrad, maxGrad);
+
+						const double wSizeSafe = FMath::IsFinite(wSize) ? wSize : 1.0;
+						const double blend = 0.01;
+
+						double gwGrad = blend * (gdiou.dw * predBox.Z * wSizeSafe) + (1.0 - blend) * grad_sqrt_w;
+						double ghGrad = blend * (gdiou.dh * predBox.W * wSizeSafe) + (1.0 - blend) * grad_sqrt_h;
+
+						auto clamp_vec2 = [&](double& x, double& y, double m) {
+							const double n = FMath::Sqrt(x * x + y * y) + 1e-9;
+							const double s = FMath::Min(1.0, m / n);
+							x *= s; y *= s;
+							};
+						clamp_vec2(gxGrad, gyGrad, maxGrad);
+						clamp_vec2(gwGrad, ghGrad, maxGrad);
+
+						if (comp == 1) grad = gxGrad;
+						else if (comp == 2) grad = gyGrad;
+						else if (comp == 3) grad = gwGrad;
+						else grad = ghGrad;
+
+						headErr[chIdx] = grad * HeadGradWeight;
+						if (comp == 4) localSize += diouLoss;
 					}
 
-					headErr[chIdx] = grad;
 					biasSum += grad;
 				}
 
-				// bias grad: average over spatial positions
 				headDB[oc] += biasSum / (double)plane;
-			}
-		}
 
-		// ===== B) Convolution weight gradients (standard conv backward) =====
+				objPosPart[oc] = localObjPos;
+				objNegPart[oc] = localObjNeg;
+				coordPart[oc] = localCoord;
+				sizePart[oc] = localSize;
+
+				if (localPos) {
+					posLock.Lock();
+					headPosCount += localPos;
+					posLock.Unlock();
+				}
+			});
+
+		double ObjLossSumHead_Pos = 0.0;
+		double ObjLossSumHead_Neg = 0.0;
+		double CoordLossSumHead = 0.0;
+		double SizeLossSumHead = 0.0;
+
 		for (int oc = 0; oc < outCh; ++oc)
 		{
-			const int errBase = oc * plane;
-			for (int ic = 0; ic < prevCount; ++ic)
-				for (int ky = 0; ky < K; ++ky)
-					for (int kx = 0; kx < K; ++kx)
-					{
-						double acc = 0.0;
-						for (int oy = 0; oy < grid; ++oy)
-						{
-							const int in_y = oy * stride - pad + ky;
-							if ((unsigned)in_y >= (unsigned)prevDim) continue;
-
-							for (int ox = 0; ox < grid; ++ox)
-							{
-								const int in_x = ox * stride - pad + kx;
-								if ((unsigned)in_x >= (unsigned)prevDim) continue;
-
-								const int inIdx = inputOffset + ic * prevPlane + in_y * prevDim + in_x;
-								const int errIdx = errBase + oy * grid + ox;
-								acc += featuresPtr[inIdx] * headErr[errIdx];
-							}
-						}
-						const int wIdx = (oc * prevCount + ic) * (K * K) + ky * K + kx;
-						headDW[wIdx] += acc / plane;
-					}
+			ObjLossSumHead_Pos += objPosPart[oc];
+			ObjLossSumHead_Neg += objNegPart[oc];
+			CoordLossSumHead += coordPart[oc];
+			SizeLossSumHead += sizePart[oc];
 		}
 
-		// ===== C) Backprop to previous feature map (transpose conv) =====
+		const int totalCells = plane * numAnch;
+		const int posSafe = FMath::Max(headPosCount, 1);
+		const int negSafe = FMath::Max(totalCells - headPosCount, 1);
+
+		ObjLossSumHead_Pos /= posSafe;
+		ObjLossSumHead_Neg /= negSafe;
+		CoordLossSumHead /= posSafe;
+		SizeLossSumHead /= posSafe;
+
+		const double headBal = 1.0;
+
+		ObjLossSum += headBal * ObjLossSumHead_Pos;
+		ObjLossSumNeg += headBal * ObjLossSumHead_Neg;
+		CoordLossSum += headBal * CoordLossSumHead;
+		SizeLossSum += headBal * SizeLossSumHead;
+
+		
+		ParallelFor(outCh, [&](int32 oc)
+			{
+				const int errBase = oc * plane;
+				for (int ic = 0; ic < prevCount; ++ic)
+					for (int ky = 0; ky < K; ++ky)
+						for (int kx = 0; kx < K; ++kx)
+						{
+							double acc = 0.0;
+							for (int oy = 0; oy < grid; ++oy)
+							{
+								const int in_y = oy * stride - pad + ky;
+								if ((unsigned)in_y >= (unsigned)prevDim) continue;
+
+								for (int ox = 0; ox < grid; ++ox)
+								{
+									const int in_x = ox * stride - pad + kx;
+									if ((unsigned)in_x >= (unsigned)prevDim) continue;
+
+									const int inIdx = inputOffset + ic * prevPlane + in_y * prevDim + in_x;
+									const int errIdx = errBase + oy * grid + ox;
+									acc += featuresPtr[inIdx] * headErr[errIdx];
+								}
+							}
+							const int wIdx = (oc * prevCount + ic) * (K * K) + ky * K + kx;
+							headDW[wIdx] += acc / (double)plane; 
+						}
+			});
+
+		
 		TArray<double> prevGrad; prevGrad.Init(0.0, prevCount * prevPlane);
 		double* RESTRICT pg = prevGrad.GetData();
 
@@ -1000,53 +1176,68 @@ void YOLO::YOLOHeadBackward(const TArray<double>& Targets)
 			}
 		}
 
-		// ===== D) Optional: undo per-head normalization effect =====
-		double* RESTRICT g = pg;
-		//if (HeadNormMean.IsValidIndex(head) && HeadNormVar.IsValidIndex(head))
+
+		const int nn = prevPlane;
+		const double* RESTRICT invStdPtr = HeadNormVar[head].GetData();
+		const double* RESTRICT meanPtr = HeadNormMean[head].GetData();
+		double* RESTRICT xgrad = pg;  // input grad after head conv
+
+		//for (int c = 0; c < prevCount; ++c)
 		//{
-		//	const TArray<double>& means = HeadNormMean[head];
-		//	const TArray<double>& invStds = HeadNormVar[head];
-		//	const double mixAlpha = 0.85;
+		//	const double invStd = invStdPtr[c];
+		//	const double mean = meanPtr[c];
+		//	double sumGrad = 0.0;
+		//	double sumGradXHat = 0.0;
+		//	const double* x = featuresPtr + inputOffset + c * prevPlane;
+		//	double* g = pg + c * prevPlane;
 
-		//	for (int c = 0; c < prevCount; ++c)
+		//	for (int i = 0; i < prevPlane; ++i)
 		//	{
-		//		const double mean = means.IsValidIndex(c) ? means[c] : 0.0;
-		//		const double invStd = invStds.IsValidIndex(c) ? invStds[c] : 1.0;
-
-		//		const double* RESTRICT x = featuresPtr + inputOffset + c * prevPlane;
-		//		double* RESTRICT gc = pg + c * prevPlane;
-
-		//		double sum_g = 0.0;
-		//		double sum_gx = 0.0;
-		//		for (int i = 0; i < prevPlane; ++i)
-		//		{
-		//			const double xm = x[i] - mean;
-		//			sum_g += gc[i];
-		//			sum_gx += gc[i] * xm;
-		//		}
-
-		//		const double invN = 1.0 / (double)prevPlane;
-		//		for (int i = 0; i < prevPlane; ++i)
-		//		{
-		//			const double xm = x[i] - mean;
-		//			const double term = (prevPlane * gc[i]) - sum_g - xm * invStd * sum_gx;
-		//			gc[i] = invStd * invN * term * mixAlpha;
-		//		}
+		//		sumGrad += g[i];
+		//		sumGradXHat += g[i] * (x[i] - mean) * invStd;
 		//	}
-		//	g = pg;
+
+		//	for (int i = 0; i < prevPlane; ++i)
+		//	{
+		//		const double xHat = (x[i] - mean) * invStd;
+		//		g[i] = invStd * (nn * g[i] - sumGrad - xHat * sumGradXHat) / nn;
+		//	}
 		//}
 
-		// ===== E) Accumulate into global Errors buffer for this stem layer =====
 		if (Errors.Num() < inputOffset + prevCount * prevPlane)
 			Errors.SetNumZeroed(inputOffset + prevCount * prevPlane, false);
-
+		const double normScale = 1.0 / static_cast<double>(prevPlane);
 		double* RESTRICT dst = errorsPtr + inputOffset;
 		for (int i = 0, n = prevCount * prevPlane; i < n; ++i)
-			dst[i] += g[i];
+			dst[i] += pg[i] * normScale;
 
-		// Advance to next head's target slice
+		{
+			const int nNet = HeadNetFeatures[head].Num();
+			if (PrevHeadNetFeatures.Num() <= head) PrevHeadNetFeatures.AddDefaulted();
+			PrevHeadNetFeatures[head].SetNumUninitialized(nNet);
+			FMemory::Memcpy(PrevHeadNetFeatures[head].GetData(), HeadNetFeatures[head].GetData(), nNet * sizeof(double));
+
+			const int nOut = HeadFeatures[head].Num();
+			if (PrevHeadFeatures.Num() <= head) PrevHeadFeatures.AddDefaulted();
+			PrevHeadFeatures[head].SetNumUninitialized(nOut);
+			FMemory::Memcpy(PrevHeadFeatures[head].GetData(), HeadFeatures[head].GetData(), nOut * sizeof(double));
+		}
+
 		globalTgtOffset += plane * numAnch * kOutPerAnchor;
 	}
+
+
+	auto clamp01 = [](double v) { return FMath::Clamp(v, -0.1, 0.1); };
+
+	auto sigma_grad = [](double log_sigma, double loss) {
+		const double w = FMath::Exp(-2.0 * log_sigma);
+		return FMath::Clamp(-2.0 * w * loss + 1.0, -0.1, 0.1);
+		};
+
+	LogSigmaObjDelta = sigma_grad(LogSigmaObj, ObjLossSum);
+	LogSigmaNegObjDelta = sigma_grad(LogSigmaNegObj, ObjLossSumNeg);
+	LogSigmaCoordDelta = sigma_grad(LogSigmaCoord, CoordLossSum);
+	LogSigmaSizeDelta = sigma_grad(LogSigmaSize, SizeLossSum);
 }
 
 
@@ -1240,48 +1431,25 @@ void YOLO::ActivateAndDerive(int LayerID)
 	const int mapArea = dim * dim;
 	const int layerBase = FeatureStart(LayerID);
 
-	const bool isOutput = (LayerID == MapCounts.Num() - 1);
-	const int outputsPerAnchor = 5;
-
 	double* RESTRICT featPtr = Features.GetData();
 	double* RESTRICT derivPtr = Derivatives.GetData();
 	const double* RESTRICT normPtr = NormFeatures.GetData() + layerBase;
-	const double* RESTRICT netPtr = NetFeatures.GetData() + layerBase; // only needed for Mish
+	const double* RESTRICT netPtr = NetFeatures.GetData() + layerBase;
 
 	auto Sigmoid = [](double x) { return 1.0 / (1.0 + FMath::Exp(-x)); };
 
-	for (int a = 0; a < numMaps; ++a)
-	{
-		const int base = layerBase + a * mapArea;
-		double* RESTRICT f = featPtr + base;
-		double* RESTRICT d = derivPtr + base;
-		const double* RESTRICT n = normPtr + a * mapArea;
-		const double* RESTRICT pre = netPtr + a * mapArea;
+	const int actID = ActivationFunctionSchedule[LayerID];
 
-		//if (isOutput)
-		//{
-		//	const int comp = a % outputsPerAnchor; // 0=conf,1=tx,2=ty,3=tw,4=th
-		//	if (comp < 3)
-		//	{
-		//		for (int i = 0; i < mapArea; ++i)
-		//		{
-		//			const double v = Sigmoid(n[i]);
-		//			f[i] = v;
-		//			d[i] = v * (1.0 - v);
-		//		}
-		//	}
-		//	else
-		//	{
-		//		for (int i = 0; i < mapArea; ++i)
-		//		{
-		//			f[i] = n[i];
-		//			d[i] = 1.0;
-		//		}
-		//	}
-		//}
-		//else
-		//{
-			switch (ActivationFunctionSchedule[LayerID])
+	// --- Parallelize across maps (channels) ---
+	ParallelFor(numMaps, [&](int32 a)
+		{
+			const int base = layerBase + a * mapArea;
+			double* RESTRICT f = featPtr + base;
+			double* RESTRICT d = derivPtr + base;
+			const double* RESTRICT n = normPtr + a * mapArea;
+			const double* RESTRICT pre = netPtr + a * mapArea;
+
+			switch (actID)
 			{
 			case 0: // Tanh
 				for (int i = 0; i < mapArea; ++i)
@@ -1291,6 +1459,7 @@ void YOLO::ActivateAndDerive(int LayerID)
 					d[i] = 1.0 - v * v;
 				}
 				break;
+
 			case 1: // Sigmoid
 				for (int i = 0; i < mapArea; ++i)
 				{
@@ -1299,6 +1468,7 @@ void YOLO::ActivateAndDerive(int LayerID)
 					d[i] = v * (1.0 - v);
 				}
 				break;
+
 			case 2: // ELU
 				for (int i = 0; i < mapArea; ++i)
 				{
@@ -1307,6 +1477,7 @@ void YOLO::ActivateAndDerive(int LayerID)
 					else { const double e = FMath::Exp(x); f[i] = ELUConst * (e - 1.0); d[i] = ELUConst * e; }
 				}
 				break;
+
 			case 3: // Leaky ReLU
 				for (int i = 0; i < mapArea; ++i)
 				{
@@ -1315,7 +1486,8 @@ void YOLO::ActivateAndDerive(int LayerID)
 					else { f[i] = ReLUConst * x; d[i] = ReLUConst; }
 				}
 				break;
-			case 4: // Mish-like (v = pre * sigmoid(pre))
+
+			case 4: // Mish-like
 				for (int i = 0; i < mapArea; ++i)
 				{
 					const double x = n[i] * 0.85;
@@ -1324,45 +1496,41 @@ void YOLO::ActivateAndDerive(int LayerID)
 					d[i] = s * (1.0 + x * (1.0 - s));
 				}
 				break;
-			case 5: // Serf Sinusoidal Error Function
+
+			case 5: // Serf (Sinusoidal Error Function)
 				for (int i = 0; i < mapArea; ++i)
 				{
-					const double softplus = (pre[i] > 20.0) ? pre[i] : log1p(exp(pre[i]));
+					const double softplus = (n[i] > 20.0) ? n[i] : log1p(exp(n[i]));
 					const double inner = erf(softplus);
-
-					f[i] = pre[i] * inner;
-
-					const double term = (2.0 / sqrt(PI)) * exp(-softplus * softplus) * Sigmoid(pre[i]);
-					d[i] = erf(softplus) + pre[i] * term;
+					f[i] = n[i] * inner;
+					const double term = (2.0 / sqrt(PI)) * exp(-softplus * softplus) * Sigmoid(n[i]);
+					d[i] = inner + n[i] * term;
 				}
 				break;
-			case 6: //GELU
+
+			case 6: // GELU
 				for (int i = 0; i < mapArea; ++i)
 				{
 					const double SqrtOverPi = sqrt(2.0 / PI);
 					const double Inner = SqrtOverPi * (n[i] + 0.044715 * FMath::Pow(n[i], 3.0));
-
 					f[i] = 0.5 * n[i] * (1.0 + FMath::Tanh(Inner));
-
-					double Inner2 = 1.0 - FMath::Tanh(Inner) * FMath::Tanh(Inner);
-					double Term1 = 0.5 * (1.0 + FMath::Tanh(Inner));
-					double Term2 = 0.5 * pre[i] * Inner2 * SqrtOverPi * (1.0 + 3.0 * 0.044715 * FMath::Pow(n[i], 2.0));
-
+					const double Inner2 = 1.0 - FMath::Tanh(Inner) * FMath::Tanh(Inner);
+					const double Term1 = 0.5 * (1.0 + FMath::Tanh(Inner));
+					const double Term2 = 0.5 * n[i] * Inner2 * SqrtOverPi *
+						(1.0 + 3.0 * 0.044715 * FMath::Pow(n[i], 2.0));
 					d[i] = Term1 + Term2;
 				}
-
 				break;
-			case 7: //SiLU
+
+			case 7: // SiLU
 				for (int i = 0; i < mapArea; ++i)
 				{
 					const double Sig = 1.0 / (1.0 + exp(-n[i]));
-
 					f[i] = Sig * n[i];
-
 					d[i] = Sig + n[i] * Sig * (1.0 - Sig);
 				}
-
 				break;
+
 			default: // Linear
 				for (int i = 0; i < mapArea; ++i)
 				{
@@ -1371,8 +1539,7 @@ void YOLO::ActivateAndDerive(int LayerID)
 				}
 				break;
 			}
-		}
-	//}
+		});
 }
 
 double YOLO::ComputeCIoU(FVector4 pred, FVector4 target)
@@ -1467,6 +1634,7 @@ void YOLO::Backward(const TArray<double>& Inputs, const TArray<double>& Outputs)
 	// Heads inject gradients (also backprop through NormalizeSet inside YOLOHeadBackward)
 	YOLOHeadBackward(Outputs);
 
+
 	// Top-down conv sweep
 	for (int layerID = lastLayerID; layerID >= 0; --layerID)
 	{
@@ -1529,7 +1697,11 @@ void YOLO::Backward(const TArray<double>& Inputs, const TArray<double>& Outputs)
 	}
 
 	// Optimizer step (batched)
+	if (Iteration % BatchSize == 0)
+	{
 		ApplyGradientDeltas();
+	}
+		
 
 	Iteration++;
 }
@@ -1558,65 +1730,63 @@ void YOLO::GradientsWRTFilters(int LayerID)
 	double* RESTRICT deltaPtr = Deltas.GetData();
 	double* RESTRICT biasDeltaPtr = BiasDelta.GetData();
 
-	// Bias grads
-	for (int omap = 0; omap < outMaps; ++omap)
-	{
-		const int eBase = outBase + omap * outPlane;
-		double sum = 0.0;
-		for (int i = 0; i < outPlane; ++i) sum += errPtr[eBase + i];
-		biasDeltaPtr[biasBase + omap] += sum / (double)outPlane;
-	}
-
-	// Filter grads
-	for (int omap = 0; omap < outMaps; ++omap)
-	{
-		const int eBase = outBase + omap * outPlane;
-		const int fOMapBase = filtBase + omap * inCount * kSize;
-
-		for (int imap = 0; imap < inCount; ++imap)
+	// === Parallelize per-output-map (omap) ===
+	ParallelFor(outMaps, [&](int32 omap)
 		{
-			const int inMapBase = inBase + imap * inPlane;
-			const int fBase = fOMapBase + imap * kSize;
+			const int eBase = outBase + omap * outPlane;
+			const int fOMapBase = filtBase + omap * inCount * kSize;
 
-			for (int ky = 0; ky < kDim; ++ky)
+			// ---- Bias gradient (independent per omap) ----
+			double biasSum = 0.0;
+			for (int i = 0; i < outPlane; ++i)
+				biasSum += errPtr[eBase + i];
+			biasDeltaPtr[biasBase + omap] += biasSum / (double)outPlane;
+
+			// ---- Filter weight gradients ----
+			for (int imap = 0; imap < inCount; ++imap)
 			{
-				for (int kx = 0; kx < kDim; ++kx)
+				const int inMapBase = inBase + imap * inPlane;
+				const int fBase = fOMapBase + imap * kSize;
+
+				for (int ky = 0; ky < kDim; ++ky)
 				{
-					double acc = 0.0;
-
-					for (int oy = 0; oy < outDim; ++oy)
+					for (int kx = 0; kx < kDim; ++kx)
 					{
-						const int iy = oy * stride - pad + ky;
-						if ((unsigned)iy >= (unsigned)inDim) continue;
+						double acc = 0.0;
 
-						const int eRow = eBase + oy * outDim;
-
-						for (int ox = 0; ox < outDim; ++ox)
+						for (int oy = 0; oy < outDim; ++oy)
 						{
-							const int ix = ox * stride - pad + kx;
-							if ((unsigned)ix >= (unsigned)inDim) continue;
+							const int iy = oy * stride - pad + ky;
+							if ((unsigned)iy >= (unsigned)inDim) continue;
 
-							acc += errPtr[eRow + ox] * inFeat[inMapBase + iy * inDim + ix];
+							const int eRow = eBase + oy * outDim;
+
+							for (int ox = 0; ox < outDim; ++ox)
+							{
+								const int ix = ox * stride - pad + kx;
+								if ((unsigned)ix >= (unsigned)inDim) continue;
+
+								acc += errPtr[eRow + ox] * inFeat[inMapBase + iy * inDim + ix];
+							}
 						}
-					}
 
-					deltaPtr[fBase + ky * kDim + kx] += acc;
+						deltaPtr[fBase + ky * kDim + kx] += acc;
+					}
 				}
 			}
-		}
-	}
+		});
 }
 
 void YOLO::ApplyGradientDeltas()
 {
 	const double eps = 1e-8;
-	const double AdamWDecay = 1e-2;   // weight decay for weights ONLY
+	const double AdamWDecay = 1.0;   // weight decay for weights ONLY
 	const int numLayers = MapCounts.Num();
-	const double LRMax = 0.0002;	
-	const double LRMin = 0.000001;
-	const double LRMaxHead = 5e-4;
-	const double LRMinHead = 0.000001;
-	const int CycleCount = 250;
+	const double LRMax = 0.001;	
+	const double LRMin = 0.00001;
+	const double LRMaxHead = 0.001;
+	const double LRMinHead = 0.00001;
+	const int CycleCount = 100;
 
 	GEngine->AddOnScreenDebugMessage(200, 5.f, FColor::Orange, FString("HEAD 0 DELTAS: ") + FString::SanitizeFloat(static_cast<double>(GetMean(HeadDeltas[0]))));
 	GEngine->AddOnScreenDebugMessage(201, 5.f, FColor::Orange, FString("HEAD 1 DELTAS: ") + FString::SanitizeFloat(static_cast<double>(GetMean(HeadDeltas[1]))));
@@ -1706,6 +1876,7 @@ void YOLO::ApplyGradientDeltas()
 
 		for (int i = fStart; i < fEnd; ++i)
 		{
+			delta[i] /= BatchSize;	
 			dMean[i] = AdamB1 * dMean[i] + (1.0 - AdamB1) * delta[i];
 			dVar[i] = AdamB2 * dVar[i] + (1.0 - AdamB2) * (delta[i] * delta[i]);
 
@@ -1723,13 +1894,14 @@ void YOLO::ApplyGradientDeltas()
 
 		for (int i = bStart; i < bEnd; ++i)
 		{
+			bDelta[i] /= BatchSize;
 			bMean[i] = AdamB1 * bMean[i] + (1.0 - AdamB1) * bDelta[i];
 			bVar[i] = AdamB2 * bVar[i] + (1.0 - AdamB2) * (bDelta[i] * bDelta[i]);
 
 			const double mHat = bMean[i] / (1.0 - pow(AdamB1, BatchIteration));
 			const double vHat = bVar[i] / (1.0 - pow(AdamB2, BatchIteration));
 
-			bias[i] -= LR * (mHat / (sqrt(vHat) + eps)); // NO decay on bias
+			bias[i] -= (LR) * (mHat / (sqrt(vHat) + eps)); // NO decay on bias
 
 			bDelta[i] = 0.0;
 		}
@@ -1738,10 +1910,13 @@ void YOLO::ApplyGradientDeltas()
 	// =====================================================================
 	// === (C) LAYERNORM PARAMS (NO DECAY) ==================================
 	// =====================================================================
-	const double LN_LR = 1e-3;
+	const double LN_LR = LearningRate[0] * 1.0;
 
 	for (int i = 0; i < NormGammaDelta.Num(); ++i)
 	{
+		gDel[i] /= BatchSize;
+		beDel[i] /= BatchSize;
+
 		gMean[i] = AdamB1 * gMean[i] + (1.0 - AdamB1) * gDel[i];
 		gVar[i] = AdamB2 * gVar[i] + (1.0 - AdamB2) * (gDel[i] * gDel[i]);
 
@@ -1766,7 +1941,22 @@ void YOLO::ApplyGradientDeltas()
 	// =====================================================================
 	for (int h = 0; h < HeadDeltas.Num(); ++h)
 	{
-		const double hLR = HeadLR;
+		double hLR = HeadLR;
+
+		switch (h)
+		{
+		case 0:
+			hLR *= 5.0;
+			break;
+
+		case 1:
+			hLR *= 3.0;
+			break;
+
+		case 2:
+			hLR *=1.0;
+			break;
+		}
 
 		double* RESTRICT hDel = HeadDeltas[h].GetData();
 		double* RESTRICT hM = HeadDeltasMean[h].GetData();
@@ -1775,6 +1965,24 @@ void YOLO::ApplyGradientDeltas()
 
 		for (int i = 0; i < HeadDeltas[h].Num(); ++i)
 		{
+			switch (i % 5)
+			{
+			case 0:
+				hLR = HeadLR * 1.0;
+				break;
+			case 1:
+			case 2:
+				hLR = HeadLR * 1.0;
+				break;
+			case 3:
+			case 4:
+				hLR = HeadLR * 1.0;
+				break;
+			
+			}
+
+			hDel[i] /= BatchSize;
+
 			hM[i] = AdamB1 * hM[i] + (1.0 - AdamB1) * hDel[i];
 			hV[i] = AdamB2 * hV[i] + (1.0 - AdamB2) * (hDel[i] * hDel[i]);
 
@@ -1794,13 +2002,15 @@ void YOLO::ApplyGradientDeltas()
 
 		for (int i = 0; i < HeadBiasDeltas[h].Num(); ++i)
 		{
+			hbD[i] /= BatchSize;
+
 			hbM[i] = AdamB1 * hbM[i] + (1.0 - AdamB1) * hbD[i];
 			hbV[i] = AdamB2 * hbV[i] + (1.0 - AdamB2) * (hbD[i] * hbD[i]);
 
 			const double mHat = hbM[i] / (1.0 - pow(AdamB1, BatchIteration));
 			const double vHat = hbV[i] / (1.0 - pow(AdamB2, BatchIteration));
 
-			hb[i] -= hLR * (mHat / (sqrt(vHat) + eps)); // no decay
+			hb[i] -= (hLR) * (mHat / (sqrt(vHat) + eps)); // no decay
 
 			hbD[i] = 0.0;
 		}
@@ -1812,8 +2022,19 @@ void YOLO::ApplyGradientDeltas()
 	double mHat = LogSigmaMeanObj / (1.0 - pow(AdamB1, BatchIteration));
 	double vHat = LogSigmaVarObj / (1.0 - pow(AdamB2, BatchIteration));
 
-	LogSigmaObj -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaObj -= 0.001 * (mHat / (sqrt(vHat) + 1e-8));
 	LogSigmaObjDelta = 0;
+
+
+	LogSigmaMeanNegObj = AdamB1 * LogSigmaMeanNegObj + (1.0 - AdamB1) * LogSigmaNegObjDelta;
+	LogSigmaVarNegObj = AdamB2 * LogSigmaVarNegObj + (1.0 - AdamB2) * FMath::Pow(LogSigmaNegObjDelta, 2.0);
+
+	mHat = LogSigmaMeanNegObj / (1.0 - pow(AdamB1, BatchIteration));
+	vHat = LogSigmaVarNegObj / (1.0 - pow(AdamB2, BatchIteration));
+
+	LogSigmaNegObj -= 0.001 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaNegObjDelta = 0;
+
 
 	LogSigmaMeanCoord = AdamB1 * LogSigmaMeanCoord + (1.0 - AdamB1) * LogSigmaCoordDelta;
 	LogSigmaVarCoord = AdamB2 * LogSigmaVarCoord + (1.0 - AdamB2) * FMath::Pow(LogSigmaCoordDelta, 2.0);
@@ -1821,7 +2042,7 @@ void YOLO::ApplyGradientDeltas()
 	mHat = LogSigmaMeanCoord / (1.0 - pow(AdamB1, BatchIteration));
 	vHat = LogSigmaVarCoord / (1.0 - pow(AdamB2, BatchIteration));
 
-	LogSigmaCoord -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaCoord -= 0.001 * (mHat / (sqrt(vHat) + 1e-8));
 	LogSigmaCoordDelta = 0;
 
 	LogSigmaMeanSize = AdamB1 * LogSigmaMeanSize + (1.0 - AdamB1) * LogSigmaSizeDelta;
@@ -1830,17 +2051,17 @@ void YOLO::ApplyGradientDeltas()
 	mHat = LogSigmaMeanSize / (1.0 - pow(AdamB1, BatchIteration));
 	vHat = LogSigmaVarSize / (1.0 - pow(AdamB2, BatchIteration));
 
-	LogSigmaSize -= 0.01 * (mHat / (sqrt(vHat) + 1e-8));
+	LogSigmaSize -= 0.001 * (mHat / (sqrt(vHat) + 1e-8));
 	LogSigmaSizeDelta = 0;
 
 	const double progress = FMath::Clamp(Iteration / (double)CycleCount, 0.0, 1.0);
 
-	//for (int i = 0; i < LearningRate.Num(); i++)
-	//{
-	//	LearningRate[i] = LRMin + 0.5 * (LRMax - LRMin) * (1.0 + cos(PI * progress));
-	//}
+	for (int i = 0; i < LearningRate.Num(); i++)
+	{
+		LearningRate[i] = LRMin + 0.5 * (LRMax - LRMin) * (1.0 + cos(PI * progress));
+	}
 
-	//HeadLR = LRMinHead + 0.5 * (LRMaxHead - LRMinHead) * (1.0 + cos(PI * progress));
+	HeadLR = LRMinHead + 0.5 * (LRMaxHead - LRMinHead) * (1.0 + cos(PI * progress));
 
 	BatchIteration++;
 }
@@ -1858,24 +2079,24 @@ void YOLO::ZeroGradients(bool zeroOptimizerState /*= false*/)
 			FMemory::Memzero(HeadErrors[h].GetData(), HeadErrors[h].Num() * sizeof(double));
 
 	// ---- 1) Conv/stem gradient accumulators (inputs to ApplyGradientDeltas) ----
-	if (Deltas.Num() > 0)
-		FMemory::Memzero(Deltas.GetData(), Deltas.Num() * sizeof(double));
-	if (BiasDelta.Num() > 0)
-		FMemory::Memzero(BiasDelta.GetData(), BiasDelta.Num() * sizeof(double));
+	//if (Deltas.Num() > 0)
+	//	FMemory::Memzero(Deltas.GetData(), Deltas.Num() * sizeof(double));
+	//if (BiasDelta.Num() > 0)
+	//	FMemory::Memzero(BiasDelta.GetData(), BiasDelta.Num() * sizeof(double));
 
-	// ---- 2) LayerNorm gradient accumulators (inputs to ApplyGradientDeltas) ----
-	if (NormGammaDelta.Num() > 0)
-		FMemory::Memzero(NormGammaDelta.GetData(), NormGammaDelta.Num() * sizeof(double));
-	if (NormBetaDelta.Num() > 0)
-		FMemory::Memzero(NormBetaDelta.GetData(), NormBetaDelta.Num() * sizeof(double));
+	//// ---- 2) LayerNorm gradient accumulators (inputs to ApplyGradientDeltas) ----
+	//if (NormGammaDelta.Num() > 0)
+	//	FMemory::Memzero(NormGammaDelta.GetData(), NormGammaDelta.Num() * sizeof(double));
+	//if (NormBetaDelta.Num() > 0)
+	//	FMemory::Memzero(NormBetaDelta.GetData(), NormBetaDelta.Num() * sizeof(double));
 
-	// ---- 3) YOLO heads gradient accumulators (inputs to ApplyGradientDeltas) ----
-	for (int h = 0; h < HeadDeltas.Num(); ++h)
-		if (HeadDeltas[h].Num() > 0)
-			FMemory::Memzero(HeadDeltas[h].GetData(), HeadDeltas[h].Num() * sizeof(double));
-	for (int h = 0; h < HeadBiasDeltas.Num(); ++h)
-		if (HeadBiasDeltas[h].Num() > 0)
-			FMemory::Memzero(HeadBiasDeltas[h].GetData(), HeadBiasDeltas[h].Num() * sizeof(double));
+	//// ---- 3) YOLO heads gradient accumulators (inputs to ApplyGradientDeltas) ----
+	//for (int h = 0; h < HeadDeltas.Num(); ++h)
+	//	if (HeadDeltas[h].Num() > 0)
+	//		FMemory::Memzero(HeadDeltas[h].GetData(), HeadDeltas[h].Num() * sizeof(double));
+	//for (int h = 0; h < HeadBiasDeltas.Num(); ++h)
+	//	if (HeadBiasDeltas[h].Num() > 0)
+	//		FMemory::Memzero(HeadBiasDeltas[h].GetData(), HeadBiasDeltas[h].Num() * sizeof(double));
 
 	// ---- 4) (Optional) Optimizer state reset ----
 	if (zeroOptimizerState)
@@ -2060,13 +2281,11 @@ TArray<double> YOLO::LayerNormBackward(TArray<double> Gradients, int LayerID, bo
 	const double* RESTRICT x = Features.GetData() + start;
 	const double* RESTRICT g = Gradients.GetData();
 
-	// We assume Norm* arrays are laid out per-channel across layers.
-	// Compute channel offset up to this layer.
+	// Offset to channel stats
 	int channelOffset = 0;
 	for (int l = 0; l < LayerID; ++l)
 		channelOffset += MapCounts[l];
 
-	// Pointers to per-channel stats/params for this layer
 	const double* RESTRICT meanPtr = NormMean.GetData() + channelOffset;
 	const double* RESTRICT varPtr = NormVar.GetData() + channelOffset;
 	const double* RESTRICT gammaPtr = NormGamma.GetData() + channelOffset;
@@ -2078,53 +2297,53 @@ TArray<double> YOLO::LayerNormBackward(TArray<double> Gradients, int LayerID, bo
 
 	TArray<double> gradInput;
 	if (bComputeInputGrad)
-	{
 		gradInput.SetNumZeroed(layerSize);
-	}
 
-	for (int c = 0; c < numMaps; ++c)
-	{
-		const double mean = meanPtr[c];
-		const double invStd = 1.0 / FMath::Sqrt(varPtr[c] + eps);
-		const double gamma = gammaPtr[c];
-
-		double sum_dy = 0.0;
-		double sum_dy_xhat = 0.0;
-
-		// Pass 1: accumulate param grads
-		for (int i = 0; i < plane; ++i)
+	// --- Parallelize per-channel (each map independent) ---
+	ParallelFor(numMaps, [&](int32 c)
 		{
-			const int idx = c * plane + i;
-			const double xhat = (x[idx] - mean) * invStd;
-			const double dy = g[idx];
-			sum_dy += dy;
-			sum_dy_xhat += dy * xhat;
-		}
+			const double mean = meanPtr[c];
+			const double invStd = 1.0 / FMath::Sqrt(varPtr[c] + eps);
+			const double gamma = gammaPtr[c];
 
-		// Parameter gradients (always computed)
-		dGammaPtr[c] += sum_dy_xhat;
-		dBetaPtr[c] += sum_dy;
+			double sum_dy = 0.0;
+			double sum_dy_xhat = 0.0;
 
-		// Optional: input gradient
-		if (bComputeInputGrad)
-		{
-			const double mean_dy = sum_dy / plane;
-			const double mean_dy_xhat = sum_dy_xhat / plane;
-
+			// Pass 1: accumulate parameter grads
 			for (int i = 0; i < plane; ++i)
 			{
 				const int idx = c * plane + i;
 				const double xhat = (x[idx] - mean) * invStd;
 				const double dy = g[idx];
-
-				// dL/dx = gamma * invStd * (dy - mean(dy) - xhat * mean(dy * xhat))
-				gradInput[idx] = (gamma * invStd / plane) * (plane * dy - mean_dy - xhat * mean_dy_xhat);
+				sum_dy += dy;
+				sum_dy_xhat += dy * xhat;
 			}
-		}
-	}
 
-	return gradInput; // empty if bComputeInputGrad == false
+			// Each channel c is unique to this thread no race conditions
+			dGammaPtr[c] += sum_dy_xhat;
+			dBetaPtr[c] += sum_dy;
+
+			// Optional: input gradients
+			if (bComputeInputGrad)
+			{
+				const double mean_dy = sum_dy / plane;
+				const double mean_dy_xhat = sum_dy_xhat / plane;
+				const double scale = gamma * invStd / plane;
+
+				for (int i = 0; i < plane; ++i)
+				{
+					const int idx = c * plane + i;
+					const double xhat = (x[idx] - mean) * invStd;
+					const double dy = g[idx];
+
+					gradInput[idx] = scale * (plane * dy - mean_dy - xhat * mean_dy_xhat);
+				}
+			}
+		});
+
+	return gradInput;
 }
+
 
 TArray<double> YOLO::GetFeatureSlice(int StartIndex, int Length)
 {
@@ -2202,7 +2421,6 @@ double YOLO::Sigmoid(double x)
 
 void YOLO::ConvolveHead(const TArray<double>& Inputs, int layerID)
 {
-	// 1) Resolve head index
 	const int headIdx = AnchorHeadIDs.IndexOfByKey(layerID);
 	if (headIdx == INDEX_NONE)
 	{
@@ -2210,151 +2428,128 @@ void YOLO::ConvolveHead(const TArray<double>& Inputs, int layerID)
 		return;
 	}
 
-	// 2) Geometry
-	const int inCh = MapCounts[layerID];
-	const int inDim = MapDims[layerID];
+	int inCh = MapCounts[layerID];
+	int inDim = MapDims[layerID];
 	const int inPlane = inDim * inDim;
-
 	const int numAnch = Anchors[headIdx].Num();
 	const int kSize = HeadFilterDims[headIdx];
 	const int stride = HeadStrideSchedule[headIdx];
 	const int pad = HeadPaddingSchedule[headIdx];
+	constexpr int kOutPerAnchor = 5;
 
-	constexpr int kOutPerAnchor = 5; // conf, tx, ty, tw, th
 	const int outDim = (int)FMath::FloorToInt((inDim + 2.0 * pad - kSize) / stride) + 1;
-	const int plane = outDim * outDim;
+	int plane = outDim * outDim;
 	const int outSize = numAnch * plane * kOutPerAnchor;
 
-	// 3) Buffers
-	const double* RESTRICT inPtr = Inputs.GetData();
-	const double* RESTRICT filtPtr = HeadFilters[headIdx].GetData();
-	const double* RESTRICT biasPtr = HeadBiases[headIdx].GetData();
-	double* RESTRICT NetPtr = HeadNetFeatures[headIdx].GetData();
-	TArray<double>& outArr = HeadFeatures[headIdx]; // final (post-activation for conf/tx/ty), interleaved
-	outArr.SetNumZeroed(outSize);
-	double* RESTRICT outPtr = outArr.GetData();
+	///////////
+	TArray<double> NormInputs;
+	NormInputs.SetNumUninitialized(Inputs.Num());
 
-	if (!filtPtr || !biasPtr || !outPtr)
-	{
-		UE_LOG(LogTemp, Error, TEXT("ConvolveHead: invalid buffer pointer(s) for head %d"), headIdx);
-		return;
-	}
+	// === Compute per-channel normalization (mean/std) ===
+	inCh = MapCounts[layerID];
+	inDim = MapDims[layerID];
+	plane = inDim * inDim;
+	const double eps = 1e-8;
 
-	// 4) Light per-channel normalization (matches backward)
-	const double eps = 1e-6;
-	const double clampVal = 3.0;   
-	const double mixAlpha = 0.85; 
-
-	TArray<double> normInputs;
-	normInputs.SetNumUninitialized(inCh * inPlane);
-
-	//HeadNormMean[headIdx].SetNum(inCh);
-	//HeadNormVar[headIdx].SetNum(inCh);
+	//TArray<double> Mean, Var, InvStd;
+	//Mean.SetNumZeroed(inCh);
+	//Var.SetNumZeroed(inCh);
+	//InvStd.SetNumZeroed(inCh);
 
 	//for (int c = 0; c < inCh; ++c)
 	//{
-	//	const double* RESTRICT src = inPtr + c * inPlane;
-	//	double* RESTRICT dst = normInputs.GetData() + c * inPlane;
-
-
+	//	const double* src = Inputs.GetData() + c * plane;
 	//	double mean = 0.0;
-	//	for (int i = 0; i < inPlane; ++i)
-	//		mean += src[i];
-	//	mean /= (double)inPlane;
+	//	for (int i = 0; i < plane; ++i) mean += src[i];
+	//	mean /= plane;
 
 	//	double var = 0.0;
-	//	for (int i = 0; i < inPlane; ++i)
-	//	{
-	//		const double d = src[i] - mean;
-	//		var += d * d;
-	//	}
-	//	var /= (double)inPlane;
+	//	for (int i = 0; i < plane; ++i)
+	//		var += FMath::Square(src[i] - mean);
+	//	var /= plane;
 
-	//	const double invStd = 1.0 / FMath::Sqrt(var + eps);
+	//	double invStd = 1.0 / FMath::Sqrt(var + eps);
+	//	Mean[c] = mean;
+	//	Var[c] = var;
+	//	InvStd[c] = invStd;
 
-	//	HeadNormMean[headIdx][c] = mean;
-	//	HeadNormVar[headIdx][c] = invStd;
-
-	//	for (int i = 0; i < inPlane; ++i)
-	//	{
-	//		// z-score normalize
-	//		double v = (src[i] - mean) * invStd;
-
-	//		// clamp to prevent outliers
-	//		v = FMath::Clamp(v, -clampVal, clampVal);
-
-	//		// soft-blend with original to keep contrast cues
-	//		v = mixAlpha * v + (1.0 - mixAlpha) * src[i];
-
-	//		
-	//		v = FMath::Clamp(v / clampVal, -1.0, 1.0);
-
-	//		dst[i] = v;
-	//	}
+	//	double* dst = NormInputs.GetData() + c * plane;
+	//	for (int i = 0; i < plane; ++i)
+	//		dst[i] = (src[i] - mean) * invStd;
 	//}
 
-	const double* RESTRICT inNorm = Inputs.GetData();
+	//// Save for backward
+	//HeadNormMean[headIdx] = Mean;
+	//HeadNormVar[headIdx] = InvStd;
 
-	// 5) Convolution rite into interleaved layout with correct activation
+	////////////////
+
+	//PrevHeadFeatures[headIdx] = HeadFeatures[headIdx];
+	//PrevHeadNetFeatures[headIdx] = HeadNetFeatures[headIdx];
+
+	const double* RESTRICT inPtr = Inputs.GetData();
+	const double* RESTRICT filtPtr = HeadFilters[headIdx].GetData();
+	const double* RESTRICT biasPtr = HeadBiases[headIdx].GetData();
+
+	TArray<double>& netArr = HeadNetFeatures[headIdx];
+	TArray<double>& outArr = HeadFeatures[headIdx];
+	netArr.SetNumZeroed(outSize);
+	outArr.SetNumZeroed(outSize);
+
+	double* RESTRICT netPtr = netArr.GetData();
+	double* RESTRICT outPtr = outArr.GetData();
+
 	auto Sigmoid = [](double x) { return 1.0 / (1.0 + FMath::Exp(-x)); };
 
-	for (int a = 0; a < numAnch; ++a)
-	{
-		// Channels for this anchor start at ocBase
-		const int ocBase = a * kOutPerAnchor;
-
-		for (int gy = 0; gy < outDim; ++gy)
+	// Parallelize per (anchor, cell)
+	const int totalCells = numAnch * outDim * outDim;
+	ParallelFor(totalCells, [&](int32 idx)
 		{
+			const int a = idx / (outDim * outDim);
+			const int rem = idx % (outDim * outDim);
+			const int gy = rem / outDim;
+			const int gx = rem % outDim;
+
 			const int baseY = gy * stride - pad;
-			for (int gx = 0; gx < outDim; ++gx)
+			const int baseX = gx * stride - pad;
+			const int spatial = gy * outDim + gx;
+			const int ocBase = a * kOutPerAnchor;
+
+			for (int comp = 0; comp < kOutPerAnchor; ++comp)
 			{
-				const int baseX = gx * stride - pad;
-				const int spatial = gy * outDim + gx;
+				const int oc = ocBase + comp;
+				double sum = 0.0;
 
-				// Compute each component channel for this anchor at (gx,gy)
-				for (int comp = 0; comp < kOutPerAnchor; ++comp)
+				for (int ic = 0; ic < inCh; ++ic)
 				{
-					const int oc = ocBase + comp;
+					const int inBase = ic * inPlane;
+					const int wBase = (oc * inCh + ic) * (kSize * kSize);
 
-					// sum conv
-					double sum = 0.0;
-					for (int ic = 0; ic < inCh; ++ic)
+					for (int ky = 0; ky < kSize; ++ky)
 					{
-						const int inBase = ic * inPlane;
-						const int wBase = (oc * inCh + ic) * (kSize * kSize);
+						const int iy = baseY + ky;
+						if ((unsigned)iy >= (unsigned)inDim) continue;
 
-						for (int ky = 0; ky < kSize; ++ky)
+						for (int kx = 0; kx < kSize; ++kx)
 						{
-							const int iy = baseY + ky;
-							if ((unsigned)iy >= (unsigned)inDim) continue;
+							const int ix = baseX + kx;
+							if ((unsigned)ix >= (unsigned)inDim) continue;
 
-							for (int kx = 0; kx < kSize; ++kx)
-							{
-								const int ix = baseX + kx;
-								if ((unsigned)ix >= (unsigned)inDim) continue;
-
-								sum += inNorm[inBase + iy * inDim + ix] * filtPtr[wBase + ky * kSize + kx];
-							}
+							sum += inPtr[inBase + iy * inDim + ix] * filtPtr[wBase + ky * kSize + kx];
 						}
 					}
-					sum += biasPtr[oc];
-					const int outIndex = ((a * plane + spatial) * kOutPerAnchor) + comp;
-					// Activation policy: conf/tx/ty -> sigmoid ; tw/th -> linear (logits)
-					double activated = sum;
-
-					NetPtr[outIndex] = sum;
-
-					if (comp <= 2) activated = Sigmoid(sum);
-
-					// *** Interleaved write to match ParseYOLOOutput ***
-					// index = ((a * plane + spatial) * kOutPerAnchor) + comp
-					
-					outPtr[outIndex] = activated;
 				}
+
+				sum += biasPtr[oc];
+				const int outIndex = ((a * plane + spatial) * kOutPerAnchor) + comp;
+
+				netPtr[outIndex] = sum;
+				double activated = (comp <= 2) ? Sigmoid(sum) : sum;
+				outPtr[outIndex] = activated;
 			}
-		}
-	}
+		});
 }
+
 
 
 
@@ -2498,7 +2693,7 @@ void YOLO::ApplyNMS(TArray<FYOLODetection>& Detections, double IoUThreshold)
 
 			const FYOLODetection& DetB = Detections[j];
 			const double IoU = ComputeIoU(DetA.BBox, DetB.BBox);
-			double dynamicPosThresh = 0.4;
+			double dynamicPosThresh = 0.25;
 			// If boxes overlap too much, keep only tighter one
 			if (IoU > dynamicPosThresh)
 			{
