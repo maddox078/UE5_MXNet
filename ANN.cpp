@@ -326,39 +326,9 @@ void ANN::Backward(TArray<double>& Inputs, TArray<double>& Outputs)
 	{
 		TgtIndex = Offset + A;
 
-		if (TgtIndex + 4 >= Activations.Num() || A + 4 >= Outputs.Num())
-		{
-			continue;
-		}
+		Errors[TgtIndex] = (Activations[TgtIndex] - Outputs[A]) * Derivatives[TgtIndex];
 
-		if (Outputs[A] == 1.0)
-		{
-			Errors[TgtIndex] = 1.0 * (Activations[TgtIndex] - Outputs[A]) * Derivatives[TgtIndex];
-			Errors[TgtIndex + 1] = 1.0 * (Activations[TgtIndex + 1] - Outputs[A+1]) * Derivatives[TgtIndex + 1];
-			Errors[TgtIndex + 2] = 1.0 * (Activations[TgtIndex + 2] - Outputs[A+2]) * Derivatives[TgtIndex + 2];
-			Errors[TgtIndex + 3] = 1.0 * (Activations[TgtIndex + 3] - Outputs[A + 3]) * Derivatives[TgtIndex + 3];
-			Errors[TgtIndex + 4] = 1.0 * (Activations[TgtIndex + 4] - Outputs[A + 4]) * Derivatives[TgtIndex + 4];
-
-			Bias[TgtIndex] += Errors[TgtIndex];
-			Bias[TgtIndex + 1] += Errors[TgtIndex + 1];
-			Bias[TgtIndex + 2] += Errors[TgtIndex + 2];
-			Bias[TgtIndex + 3] += Errors[TgtIndex + 3];
-			Bias[TgtIndex + 4] += Errors[TgtIndex + 4];
-		}
-		else
-		{
-			Errors[TgtIndex] = 0.5 * Activations[TgtIndex] * Derivatives[TgtIndex];
-			Errors[TgtIndex + 1] = 0.01 * (Activations[TgtIndex + 1] - 0.5) * Derivatives[TgtIndex + 1];
-			Errors[TgtIndex + 2] = 0.01 * (Activations[TgtIndex + 2] - 0.5) * Derivatives[TgtIndex + 2];
-			Errors[TgtIndex + 3] = 0.01 * (Activations[TgtIndex + 3] - 0.1) * Derivatives[TgtIndex + 3];
-			Errors[TgtIndex + 4] = 0.01 * (Activations[TgtIndex + 4] - 0.1) * Derivatives[TgtIndex + 4];
-
-			Bias[TgtIndex] += Errors[TgtIndex];
-			Bias[TgtIndex + 1] += Errors[TgtIndex + 1];
-			Bias[TgtIndex + 2] += Errors[TgtIndex + 2];
-			Bias[TgtIndex + 3] += Errors[TgtIndex + 3];
-			Bias[TgtIndex + 4] += Errors[TgtIndex + 4];
-		}
+		Bias[TgtIndex] += Errors[TgtIndex];
 
 		//Gather weight deltas if more than one layer, one layer may typically be used as a shallow head for sister CNN class
 		if (LayerCounts.Num() > 1)
