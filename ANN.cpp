@@ -142,6 +142,7 @@ int ANN::NeuronStart(int LayerID)
 	while(A < LayerID)
 	{
 		Offset += LayerCounts[A];  // sum all neurons in previous layers
+		A++;
 	}
 
 	return Offset;
@@ -234,11 +235,11 @@ TArray<double> ANN::GetSlice(TArray<double>& TargetList, int StartIndex, int Len
 	TArray<double> RetVal;
 	int A = StartIndex;
 
-	RetVal.SetNum(Length - StartIndex);
+	RetVal.SetNum(Length);
 
 	while (A < StartIndex + Length)
 	{
-		RetVal[A] = TargetList[A];
+		RetVal[A] = TargetList[A - StartIndex];
 
 		A++;
 	}
