@@ -450,25 +450,25 @@ void ACNN::ActivationFunctionDerivative(int LayerID)
 				switch (ActivationFunctionSchedule[LayerID])
 				{
 				case 0:
-					TempVal = FMath::Tanh(NormFeatures[NeuronIndex]);  // Use Features
+					TempVal = Features[NeuronIndex];
 					Derivatives[NeuronIndex] = 1.0 - (TempVal * TempVal);
 					break;
 				case 1:
-					TempVal = 1.0 / (1.0 + FMath::Exp(-1 * NormFeatures[NeuronIndex]));  // Use Features
+					TempVal = Features[NeuronIndex];
 					Derivatives[NeuronIndex] = TempVal * (1.0 - TempVal);
 					break;
 				case 2:
-					if (NormFeatures[NeuronIndex] > 0)  // Use Features
+					if (Features[NeuronIndex] > 0)
 					{
-						Derivatives[NeuronIndex] = 0.5;
+						Derivatives[NeuronIndex] = 1.0;
 					}
 					else
 					{
-						Derivatives[NeuronIndex] = NormFeatures[NeuronIndex] * 1.0;
+						Derivatives[NeuronIndex] = Features[NeuronIndex] + NeuralNet->ELUConst;
 					}
 					break;
 				case 3:
-					if (NormFeatures[NeuronIndex] > 0)  // Use Features
+					if (Features[NeuronIndex] > 0)
 					{
 						Derivatives[NeuronIndex] = 1.0;
 					}
@@ -490,7 +490,6 @@ void ACNN::ActivationFunctionDerivative(int LayerID)
 
 		A++;
 	}
-
 }
 
 TArray<double> ACNN::Flatten2DArray(TArray<TArray<double>>& Input)
