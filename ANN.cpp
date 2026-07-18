@@ -209,7 +209,7 @@ double ANN::ActivationFunctionDerivative(double Input, int ActivationFunctionID)
 			}
 			else
 			{
-				Output = Input * ELUConst;
+				Output = Input + ELUConst;
 			}
 			break;
 		case 3:
@@ -291,7 +291,7 @@ void ANN::Forward(TArray<double>& Inputs)
 
 			NetInputs[TgtIndex] = NetSum + Bias[TgtIndex];
 			Activations[TgtIndex] = ActivationFunction(NetInputs[TgtIndex], ActivationFunctionIDs[A]);
-			Derivatives[TgtIndex] = ActivationFunctionDerivative(Activations[A], ActivationFunctionIDs[A]);
+			Derivatives[TgtIndex] = ActivationFunctionDerivative(Activations[TgtIndex], ActivationFunctionIDs[A]);
 
 			B++;
 		}
