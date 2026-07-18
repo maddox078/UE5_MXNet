@@ -644,7 +644,6 @@ void ACNN::Backward(TArray<TArray<double>>& Inputs, TArray<double> Outputs)
 	int A = 0;
 	int B = 0;
 	int C = 0;
-	TArray<double> FlatNeurons;
 	TArray<double> FlatFeatures;
 	TArray<double> TransitionErrors;
 	TArray<double> TempGradients;
@@ -683,7 +682,7 @@ void ACNN::Backward(TArray<TArray<double>>& Inputs, TArray<double> Outputs)
 		B = 0;
 		while (B < FlatFeatures.Num())
 		{
-			TransitionDeltas[A * FlatFeatures.Num() + B] += FlatNeurons[A] * FlatFeatures[B];
+			TransitionDeltas[A * FlatFeatures.Num() + B] += NeuralNet->Errors[A] * FlatFeatures[B];
 
 			B++;
 		}
